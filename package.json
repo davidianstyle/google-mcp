@@ -1,0 +1,31 @@
+{
+  "name": "google-mcp",
+  "version": "0.1.0",
+  "description": "Consolidated Google MCP server — Gmail, Calendar, Meet, Drive, Docs, Sheets, Slides in one process.",
+  "type": "module",
+  "bin": {
+    "google-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": ["mcp", "google", "gmail", "calendar", "drive", "slides"],
+  "author": "David Chang",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "commander": "^14.0.3",
+    "google-auth-library": "^10.6.2",
+    "googleapis": "^171.4.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.4"
+  }
+}
