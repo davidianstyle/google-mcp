@@ -87,9 +87,41 @@ export function buildRawEmail(opts: {
   return headers.join("\r\n") + "\r\n\r\n" + opts.body;
 }
 
+export interface AttachmentInfo {
+  attachmentId: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+}
+
+export function extractAttachments(payload: gmail_v1.Schema$MessagePart | undefined): AttachmentInfo[] {
+  if (!payload) return [];
+  const attachments: AttachmentInfo[] = [];
+
+  function walk(part: gmail_v1.Schema$MessagePart) {
+    if (part.filename && part.filename.length > 0 && part.body?.attachmentId) {
+      attachments.push({
+        attachmentId: part.body.attachmentId,
+        filename: part.filename,
+        mimeType: part.mimeType || "application/octet-stream",
+        size: part.body.size || 0,
+      });
+    }
+    if (part.parts) {
+      for (const child of part.parts) {
+        walk(child);
+      }
+    }
+  }
+
+  walk(payload);
+  return attachments;
+}
+
 export function formatMessage(msg: gmail_v1.Schema$Message): Record<string, unknown> {
   const headers = msg.payload?.headers;
   const body = extractBody(msg.payload);
+  const attachments = extractAttachments(msg.payload);
   return {
     id: msg.id,
     threadId: msg.threadId,
@@ -101,5 +133,6 @@ export function formatMessage(msg: gmail_v1.Schema$Message): Record<string, unkn
     cc: getHeader(headers, "cc"),
     date: getHeader(headers, "date"),
     body: body.text || body.html,
+    ...(attachments.length > 0 ? { attachments } : {}),
   };
 }

@@ -3,7 +3,7 @@ import { google } from "googleapis";
 import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
-import { buildRawEmail, encodeBase64Url, extractBody, formatMessage, getHeader } from "../../utils/email.js";
+import { buildRawEmail, encodeBase64Url, extractAttachments, extractBody, formatMessage, getHeader } from "../../utils/email.js";
 
 const FILTER_TEMPLATES: Record<string, { criteria: Record<string, unknown>; action: Record<string, unknown> }> = {
   newsletter: { criteria: { query: "unsubscribe" }, action: { removeLabelIds: ["INBOX"] } },
@@ -235,6 +235,14 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
 
     const res = await gmail.users.labels.create({ userId: "me", requestBody: { name } });
     return textResult({ id: res.data.id, name: res.data.name, created: true });
+  });
+
+  server.tool("gmail_list_attachments", "List attachments on an email (returns attachment IDs, filenames, sizes)", {
+    messageId: z.string().describe("ID of the email message"),
+  }, async ({ messageId }) => {
+    const res = await api().users.messages.get({ userId: "me", id: messageId, format: "full" });
+    const attachments = extractAttachments(res.data.payload);
+    return textResult(attachments.length > 0 ? attachments : "No attachments found.");
   });
 
   server.tool("gmail_download_attachment", "Download an email attachment", {
