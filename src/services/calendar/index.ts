@@ -203,12 +203,12 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
   }, async ({ calendarId, eventId, responseStatus, sendUpdates }) => {
     const cal = api();
     const existing = await cal.events.get({ calendarId, eventId });
-    const profile = await google.oauth2({ version: "v2", auth: ctx.auth }).userinfo.get();
-    const myEmail = profile.data.email;
-
     const attendees = existing.data.attendees || [];
-    const me = attendees.find((a) => a.email === myEmail || a.self);
-    if (me) me.responseStatus = responseStatus;
+    const me = attendees.find((a) => a.self);
+    if (!me) {
+      throw new Error(`Cannot respond: authenticated user is not an attendee of event ${eventId}`);
+    }
+    me.responseStatus = responseStatus;
 
     const res = await cal.events.patch({
       calendarId, eventId, sendUpdates,
