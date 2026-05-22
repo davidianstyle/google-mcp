@@ -5,11 +5,43 @@ import { ServiceContext } from "../../types.js";
 import { textResult, mimeShortcut } from "../../utils/formatting.js";
 
 import { drive_v3 } from "googleapis";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, readdir, stat, unlink } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { randomBytes } from "node:crypto";
+import type { Readable } from "node:stream";
 
 const DOWNLOAD_CACHE_DIR = join(tmpdir(), "google-mcp");
+const DOWNLOAD_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+// One-shot cleanup of stale downloads, run on first use per process.
+// Removes files in DOWNLOAD_CACHE_DIR older than DOWNLOAD_CACHE_TTL_MS so
+// long-running MCP servers don't accumulate downloads indefinitely.
+// Best-effort: any IO error is swallowed since cleanup is non-essential.
+let cacheCleanupDone = false;
+async function cleanupStaleDownloads(): Promise<void> {
+  if (cacheCleanupDone) return;
+  cacheCleanupDone = true;
+  try {
+    const entries = await readdir(DOWNLOAD_CACHE_DIR);
+    const cutoff = Date.now() - DOWNLOAD_CACHE_TTL_MS;
+    await Promise.all(
+      entries.map(async (entry) => {
+        const path = join(DOWNLOAD_CACHE_DIR, entry);
+        try {
+          const s = await stat(path);
+          if (s.isFile() && s.mtimeMs < cutoff) await unlink(path);
+        } catch {
+          // Ignore — entry may have been removed concurrently, or a permission issue.
+        }
+      })
+    );
+  } catch {
+    // Cache dir doesn't exist yet (first run) — nothing to clean.
+  }
+}
 
 const MIME_TO_EXT: Record<string, string> = {
   "text/markdown": "md",
@@ -198,43 +230,83 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     return textResult({ success: true, action: "trashed", fileId, fileName: file.data.name });
   });
 
-  server.tool("drive_download_file", "Download a file from Drive to a local temp path. Returns { name, mimeType, path, bytes } — the file content is written to disk; use Read or Bash on the returned path to access it. For Workspace files (Docs, Sheets, etc.), exports to the requested mimeType (default text/plain).", {
+  server.tool("drive_download_file", "Download a file from Drive. Default writes to a local temp path and returns { name, mimeType, path, bytes }; caller uses Read/Bash on the path. Pass returnContent=true to skip disk and return the body inline as { name, mimeType, content, bytes, encoding } — Workspace exports as utf-8 text, native files as base64. Use inline mode only for small files where disk indirection is wasteful; for binary or large files prefer the default path mode. Files older than 24h in the cache dir are cleaned up on first use per process.", {
     fileId: z.string(),
     mimeType: z.string().optional().describe("Export MIME type for Google Workspace files (e.g., 'text/markdown', 'text/plain', 'application/pdf')"),
-  }, async ({ fileId, mimeType }) => {
+    returnContent: z.boolean().optional().default(false).describe("If true, return the file content inline (utf-8 for Workspace, base64 for binary) instead of writing to disk. Default false: write to disk and return a path."),
+  }, async ({ fileId, mimeType, returnContent }) => {
     const drive = api();
     const meta = await drive.files.get({ supportsAllDrives: true, fileId, fields: "name,mimeType" });
 
-    let body: Buffer;
-    let outMime: string;
+    const isWorkspace = !!meta.data.mimeType?.startsWith("application/vnd.google-apps.");
+    const outMime = isWorkspace
+      ? mimeType || "text/plain"
+      : meta.data.mimeType || "application/octet-stream";
 
-    if (meta.data.mimeType?.startsWith("application/vnd.google-apps.")) {
-      outMime = mimeType || "text/plain";
-      const res = await drive.files.export(
-        { fileId, mimeType: outMime },
-        { responseType: "arraybuffer" }
-      );
-      body = Buffer.from(res.data as ArrayBuffer);
-    } else {
-      outMime = meta.data.mimeType || "application/octet-stream";
+    // Inline mode: return body in the response, never touch disk.
+    if (returnContent) {
+      if (isWorkspace) {
+        const res = await drive.files.export(
+          { fileId, mimeType: outMime },
+          { responseType: "arraybuffer" }
+        );
+        const body = Buffer.from(res.data as ArrayBuffer);
+        return textResult({
+          name: meta.data.name,
+          mimeType: outMime,
+          content: body.toString("utf-8"),
+          bytes: body.byteLength,
+          encoding: "utf-8",
+        });
+      }
       const res = await drive.files.get(
         { supportsAllDrives: true, fileId, alt: "media" },
         { responseType: "arraybuffer" }
       );
-      body = Buffer.from(res.data as ArrayBuffer);
+      const body = Buffer.from(res.data as ArrayBuffer);
+      return textResult({
+        name: meta.data.name,
+        mimeType: outMime,
+        content: body.toString("base64"),
+        bytes: body.byteLength,
+        encoding: "base64",
+      });
     }
 
+    // Disk mode (default): write to a temp path and return the path.
+    await cleanupStaleDownloads();
     await mkdir(DOWNLOAD_CACHE_DIR, { recursive: true });
+
     const ext = extensionFor(outMime);
     const safeName = safeFileName(meta.data.name || fileId);
-    const path = join(DOWNLOAD_CACHE_DIR, `${safeName}-${Date.now()}.${ext}`);
-    await writeFile(path, body);
+    const suffix = randomBytes(4).toString("hex");
+    const path = join(DOWNLOAD_CACHE_DIR, `${safeName}-${Date.now()}-${suffix}.${ext}`);
+
+    let bytes: number;
+    if (isWorkspace) {
+      // Workspace exports are bounded by Google (~10MB Doc export cap); buffer is fine.
+      const res = await drive.files.export(
+        { fileId, mimeType: outMime },
+        { responseType: "arraybuffer" }
+      );
+      const body = Buffer.from(res.data as ArrayBuffer);
+      await writeFile(path, body);
+      bytes = body.byteLength;
+    } else {
+      // Native files can be arbitrarily large; stream directly to disk.
+      const res = await drive.files.get(
+        { supportsAllDrives: true, fileId, alt: "media" },
+        { responseType: "stream" }
+      );
+      await pipeline(res.data as Readable, createWriteStream(path));
+      bytes = (await stat(path)).size;
+    }
 
     return textResult({
       name: meta.data.name,
       mimeType: outMime,
       path,
-      bytes: body.byteLength,
+      bytes,
     });
   });
 
