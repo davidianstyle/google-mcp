@@ -5,7 +5,7 @@ import { ServiceContext } from "../../types.js";
 import { textResult, mimeShortcut } from "../../utils/formatting.js";
 
 import { drive_v3 } from "googleapis";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -205,30 +205,36 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     const drive = api();
     const meta = await drive.files.get({ supportsAllDrives: true, fileId, fields: "name,mimeType" });
 
-    let content: string;
+    let body: Buffer;
     let outMime: string;
 
     if (meta.data.mimeType?.startsWith("application/vnd.google-apps.")) {
       outMime = mimeType || "text/plain";
-      const res = await drive.files.export({ fileId, mimeType: outMime }, { responseType: "text" });
-      content = res.data as string;
+      const res = await drive.files.export(
+        { fileId, mimeType: outMime },
+        { responseType: "arraybuffer" }
+      );
+      body = Buffer.from(res.data as ArrayBuffer);
     } else {
       outMime = meta.data.mimeType || "application/octet-stream";
-      const res = await drive.files.get({ supportsAllDrives: true, fileId, alt: "media" }, { responseType: "text" });
-      content = res.data as string;
+      const res = await drive.files.get(
+        { supportsAllDrives: true, fileId, alt: "media" },
+        { responseType: "arraybuffer" }
+      );
+      body = Buffer.from(res.data as ArrayBuffer);
     }
 
-    mkdirSync(DOWNLOAD_CACHE_DIR, { recursive: true });
+    await mkdir(DOWNLOAD_CACHE_DIR, { recursive: true });
     const ext = extensionFor(outMime);
     const safeName = safeFileName(meta.data.name || fileId);
     const path = join(DOWNLOAD_CACHE_DIR, `${safeName}-${Date.now()}.${ext}`);
-    writeFileSync(path, content);
+    await writeFile(path, body);
 
     return textResult({
       name: meta.data.name,
       mimeType: outMime,
       path,
-      bytes: content.length,
+      bytes: body.byteLength,
     });
   });
 
