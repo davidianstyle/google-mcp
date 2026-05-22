@@ -5,6 +5,34 @@ import { ServiceContext } from "../../types.js";
 import { textResult, mimeShortcut } from "../../utils/formatting.js";
 
 import { drive_v3 } from "googleapis";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+const DOWNLOAD_CACHE_DIR = join(tmpdir(), "google-mcp");
+
+const MIME_TO_EXT: Record<string, string> = {
+  "text/markdown": "md",
+  "text/plain": "txt",
+  "text/csv": "csv",
+  "text/html": "html",
+  "application/pdf": "pdf",
+  "application/json": "json",
+  "application/zip": "zip",
+  "application/rtf": "rtf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+};
+
+function extensionFor(mime: string | null | undefined): string {
+  if (!mime) return "bin";
+  return MIME_TO_EXT[mime] || mime.split("/").pop()?.split(".").pop() || "bin";
+}
+
+function safeFileName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
+}
 
 function formatFile(f: drive_v3.Schema$File): Record<string, unknown> {
   return {
@@ -170,21 +198,38 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     return textResult({ success: true, action: "trashed", fileId, fileName: file.data.name });
   });
 
-  server.tool("drive_download_file", "Download file content", {
+  server.tool("drive_download_file", "Download a file from Drive to a local temp path. Returns { name, mimeType, path, bytes } — the file content is written to disk; use Read or Bash on the returned path to access it. For Workspace files (Docs, Sheets, etc.), exports to the requested mimeType (default text/plain).", {
     fileId: z.string(),
-    mimeType: z.string().optional().describe("Export MIME type for Google Workspace files (e.g., 'text/plain', 'application/pdf')"),
+    mimeType: z.string().optional().describe("Export MIME type for Google Workspace files (e.g., 'text/markdown', 'text/plain', 'application/pdf')"),
   }, async ({ fileId, mimeType }) => {
     const drive = api();
-    const meta = await drive.files.get({ fileId, fields: "name,mimeType" });
+    const meta = await drive.files.get({ supportsAllDrives: true, fileId, fields: "name,mimeType" });
+
+    let content: string;
+    let outMime: string;
 
     if (meta.data.mimeType?.startsWith("application/vnd.google-apps.")) {
-      const exportMime = mimeType || "text/plain";
-      const res = await drive.files.export({ fileId, mimeType: exportMime }, { responseType: "text" });
-      return textResult({ name: meta.data.name, mimeType: exportMime, content: res.data });
+      outMime = mimeType || "text/plain";
+      const res = await drive.files.export({ fileId, mimeType: outMime }, { responseType: "text" });
+      content = res.data as string;
+    } else {
+      outMime = meta.data.mimeType || "application/octet-stream";
+      const res = await drive.files.get({ supportsAllDrives: true, fileId, alt: "media" }, { responseType: "text" });
+      content = res.data as string;
     }
 
-    const res = await drive.files.get({ fileId, alt: "media" }, { responseType: "text" });
-    return textResult({ name: meta.data.name, mimeType: meta.data.mimeType, content: res.data });
+    mkdirSync(DOWNLOAD_CACHE_DIR, { recursive: true });
+    const ext = extensionFor(outMime);
+    const safeName = safeFileName(meta.data.name || fileId);
+    const path = join(DOWNLOAD_CACHE_DIR, `${safeName}-${Date.now()}.${ext}`);
+    writeFileSync(path, content);
+
+    return textResult({
+      name: meta.data.name,
+      mimeType: outMime,
+      path,
+      bytes: content.length,
+    });
   });
 
   server.tool("drive_create_folder", "Create a new folder", {
