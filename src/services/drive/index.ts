@@ -15,6 +15,11 @@ import type { Readable } from "node:stream";
 
 const DOWNLOAD_CACHE_DIR = join(tmpdir(), "google-mcp");
 const DOWNLOAD_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+// Hard cap for inline (returnContent=true) downloads to keep tool responses
+// from blowing past MCP/LLM context budgets and to avoid OOM. Callers that
+// need larger payloads should use the default disk mode.
+const MAX_INLINE_BYTES = 10 * 1024 * 1024;
+const FOLDER_MIME = "application/vnd.google-apps.folder";
 
 // Output MIME types we treat as text in inline mode. Everything else is
 // returned as base64 to avoid corrupting binary bytes through UTF-8.
@@ -39,17 +44,18 @@ function ensureCacheInitialized(): Promise<void> {
     await mkdir(DOWNLOAD_CACHE_DIR, { recursive: true });
     const entries = await readdir(DOWNLOAD_CACHE_DIR);
     const cutoff = Date.now() - DOWNLOAD_CACHE_TTL_MS;
-    await Promise.all(
-      entries.map(async (entry) => {
-        const path = join(DOWNLOAD_CACHE_DIR, entry);
-        try {
-          const s = await stat(path);
-          if (s.isFile() && s.mtimeMs < cutoff) await unlink(path);
-        } catch {
-          // Entry was removed concurrently or otherwise inaccessible. Ignore.
-        }
-      })
-    );
+    // Sequential sweep keeps file-descriptor and IO pressure bounded even
+    // when the cache dir has accumulated many entries. Cleanup runs once
+    // per process, so latency here is paid at most once.
+    for (const entry of entries) {
+      const path = join(DOWNLOAD_CACHE_DIR, entry);
+      try {
+        const s = await stat(path);
+        if (s.isFile() && s.mtimeMs < cutoff) await unlink(path);
+      } catch {
+        // Entry was removed concurrently or otherwise inaccessible. Ignore.
+      }
+    }
   })().catch((err) => {
     cacheInitPromise = null;
     throw err;
@@ -244,13 +250,26 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     return textResult({ success: true, action: "trashed", fileId, fileName: file.data.name });
   });
 
-  server.tool("drive_download_file", "Download a file from Drive. Default writes to a local temp path and returns { name, mimeType, path, bytes }; caller uses Read/Bash on the path. Pass returnContent=true to skip disk and return the body inline as { name, mimeType, content, bytes, encoding } where encoding is 'utf-8' for text MIME types (text/* and application/json) and 'base64' for everything else — including Workspace exports to binary formats like PDF/DOCX/XLSX. Use inline mode only for small files where disk indirection is wasteful; for binary or large files prefer the default path mode. Files older than 24h in the cache dir are cleaned up on first use per process.", {
+  server.tool("drive_download_file", `Download a file from Drive. Default writes to a local temp path and returns { name, mimeType, path, bytes }; caller uses Read/Bash on the path. Pass returnContent=true to skip disk and return the body inline as { name, mimeType, content, bytes, encoding } where encoding is 'utf-8' for text MIME types (text/* and application/json) and 'base64' for everything else — including Workspace exports to binary formats like PDF/DOCX/XLSX. Inline mode is capped at ${MAX_INLINE_BYTES} bytes; larger files must use disk mode. Folders cannot be downloaded; use drive_list_folder_contents to enumerate them. Files older than 24h in the cache dir are cleaned up on first use per process.`, {
     fileId: z.string(),
     mimeType: z.string().optional().describe("Export MIME type for Google Workspace files (e.g., 'text/markdown', 'text/plain', 'application/pdf')"),
     returnContent: z.boolean().optional().default(false).describe("If true, return the file content inline (utf-8 for text MIME, base64 otherwise) instead of writing to disk. Default false: write to disk and return a path."),
   }, async ({ fileId, mimeType, returnContent }) => {
     const drive = api();
-    const meta = await drive.files.get({ supportsAllDrives: true, fileId, fields: "name,mimeType" });
+    const meta = await drive.files.get({
+      supportsAllDrives: true,
+      fileId,
+      fields: "name,mimeType,size",
+    });
+
+    // Folders aren't downloadable — surface a clear error instead of letting
+    // the API call below fail opaquely. Callers should use
+    // drive_list_folder_contents to enumerate folder children.
+    if (meta.data.mimeType === FOLDER_MIME) {
+      throw new Error(
+        `Cannot download a folder (fileId=${fileId}, name=${meta.data.name}). Use drive_list_folder_contents to list its contents.`
+      );
+    }
 
     const isWorkspace = !!meta.data.mimeType?.startsWith("application/vnd.google-apps.");
     const outMime = isWorkspace
@@ -262,6 +281,16 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     // Workspace docs can be exported to binary (PDF/DOCX) which MUST be
     // base64 to preserve bytes.
     if (returnContent) {
+      // Pre-flight size guard for native files (meta.size is reliable for
+      // them). Workspace exports don't have a meta.size — they're bounded
+      // by Google's own export caps (~10MB), and we re-check post-download
+      // below as a belt-and-braces guard.
+      const reportedSize = meta.data.size ? Number(meta.data.size) : undefined;
+      if (!isWorkspace && reportedSize !== undefined && reportedSize > MAX_INLINE_BYTES) {
+        throw new Error(
+          `File too large for inline mode: ${reportedSize} bytes > ${MAX_INLINE_BYTES} byte cap. Use the default disk mode (omit returnContent) for files this size.`
+        );
+      }
       const arraybufRes = isWorkspace
         ? await drive.files.export(
             { fileId, mimeType: outMime },
@@ -272,6 +301,11 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
             { responseType: "arraybuffer" }
           );
       const body = Buffer.from(arraybufRes.data as ArrayBuffer);
+      if (body.byteLength > MAX_INLINE_BYTES) {
+        throw new Error(
+          `Downloaded body too large for inline mode: ${body.byteLength} bytes > ${MAX_INLINE_BYTES} byte cap. Use the default disk mode (omit returnContent).`
+        );
+      }
       const encoding: "utf-8" | "base64" = isTextMime(outMime) ? "utf-8" : "base64";
       return textResult({
         name: meta.data.name,
