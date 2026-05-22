@@ -26,41 +26,81 @@ const FOLDER_MIME = "application/vnd.google-apps.folder";
 // Workspace files can be exported as text (markdown/csv/html) OR as
 // binary (PDF/DOCX/XLSX), so the source format doesn't determine
 // encoding — the OUTPUT MIME does.
+//
+// Covers text/* (markdown, plain, csv, html, xml, etc.), structured
+// data formats commonly served as text (json, xml, javascript, sql,
+// yaml), and any structured suffix (+json, +xml, +yaml). When unsure,
+// we fall through to base64 — a base64-wrapped text payload is
+// recoverable, but a UTF-8-decoded binary is corrupted.
+const TEXT_MIMES = new Set([
+  "application/json",
+  "application/xml",
+  "application/javascript",
+  "application/ecmascript",
+  "application/sql",
+  "application/yaml",
+  "application/x-yaml",
+  "application/x-sh",
+  "application/x-www-form-urlencoded",
+]);
 function isTextMime(mime: string): boolean {
-  return mime.startsWith("text/") || mime === "application/json";
+  if (mime.startsWith("text/")) return true;
+  if (TEXT_MIMES.has(mime)) return true;
+  // Structured suffixes like application/atom+xml, application/ld+json.
+  return /\+(?:json|xml|yaml)$/.test(mime);
+}
+
+// Sweeps the cache dir of files older than DOWNLOAD_CACHE_TTL_MS.
+// Used both on first download per process (to handle a freshly started
+// server inheriting a stale cache dir) and periodically thereafter (to
+// keep long-running processes from accumulating downloads).
+async function sweepStaleDownloads(): Promise<void> {
+  const entries = await readdir(DOWNLOAD_CACHE_DIR);
+  const cutoff = Date.now() - DOWNLOAD_CACHE_TTL_MS;
+  // Sequential sweep keeps file-descriptor and IO pressure bounded even
+  // when the cache dir has accumulated many entries.
+  for (const entry of entries) {
+    const path = join(DOWNLOAD_CACHE_DIR, entry);
+    try {
+      const s = await stat(path);
+      if (s.isFile() && s.mtimeMs < cutoff) await unlink(path);
+    } catch {
+      // Entry was removed concurrently or otherwise inaccessible. Ignore.
+    }
+  }
 }
 
 // One-shot initialization of the cache dir: ensures the directory exists
-// and sweeps stale (>24h old) entries. Runs at most once per process per
-// successful completion. If init fails, the cached promise is cleared so
-// the next call can retry. Per-entry cleanup errors are swallowed (a
-// missing file or permission glitch on one entry shouldn't block init),
-// but a top-level mkdir/readdir failure rejects and resets so callers
-// see the real error and the next call gets a fresh attempt.
+// and runs an initial sweep. Subsequent downloads re-run the sweep at most
+// once per DOWNLOAD_CACHE_TTL_MS interval (lastSweepAt), so a long-running
+// process doesn't get stuck on the first sweep forever. If init fails, the
+// cached promise is cleared so the next call can retry. Per-entry cleanup
+// errors are swallowed inside sweepStaleDownloads, but a top-level
+// mkdir/readdir failure rejects and resets so callers see the real error
+// and the next call gets a fresh attempt.
 let cacheInitPromise: Promise<void> | null = null;
+let lastSweepAt = 0;
 function ensureCacheInitialized(): Promise<void> {
   if (cacheInitPromise) return cacheInitPromise;
   cacheInitPromise = (async () => {
     await mkdir(DOWNLOAD_CACHE_DIR, { recursive: true });
-    const entries = await readdir(DOWNLOAD_CACHE_DIR);
-    const cutoff = Date.now() - DOWNLOAD_CACHE_TTL_MS;
-    // Sequential sweep keeps file-descriptor and IO pressure bounded even
-    // when the cache dir has accumulated many entries. Cleanup runs once
-    // per process, so latency here is paid at most once.
-    for (const entry of entries) {
-      const path = join(DOWNLOAD_CACHE_DIR, entry);
-      try {
-        const s = await stat(path);
-        if (s.isFile() && s.mtimeMs < cutoff) await unlink(path);
-      } catch {
-        // Entry was removed concurrently or otherwise inaccessible. Ignore.
-      }
-    }
+    await sweepStaleDownloads();
+    lastSweepAt = Date.now();
   })().catch((err) => {
     cacheInitPromise = null;
     throw err;
   });
   return cacheInitPromise;
+}
+
+// Run an additional sweep if more than DOWNLOAD_CACHE_TTL_MS has passed
+// since the last one. Fire-and-forget so it never blocks a download.
+function maybePeriodicSweep(): void {
+  if (Date.now() - lastSweepAt < DOWNLOAD_CACHE_TTL_MS) return;
+  lastSweepAt = Date.now(); // optimistic: prevents concurrent re-entry
+  sweepStaleDownloads().catch(() => {
+    // Best-effort; an error here is non-fatal for downloads.
+  });
 }
 
 const MIME_TO_EXT: Record<string, string> = {
@@ -317,8 +357,11 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     }
 
     // Disk mode (default): ensure cache dir is initialized (with stale-file
-    // sweep), then write to a temp path and return it.
+    // sweep), then write to a temp path and return it. Trigger a periodic
+    // re-sweep in the background if it's been more than DOWNLOAD_CACHE_TTL_MS
+    // since the last one — handles long-running MCP processes.
     await ensureCacheInitialized();
+    maybePeriodicSweep();
 
     const ext = extensionFor(outMime);
     const safeName = safeFileName(meta.data.name || fileId);
@@ -326,23 +369,31 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     const path = join(DOWNLOAD_CACHE_DIR, `${safeName}-${Date.now()}-${suffix}.${ext}`);
 
     let bytes: number;
-    if (isWorkspace) {
-      // Workspace exports are bounded by Google (~10MB Doc export cap); buffer is fine.
-      const res = await drive.files.export(
-        { fileId, mimeType: outMime },
-        { responseType: "arraybuffer" }
-      );
-      const body = Buffer.from(res.data as ArrayBuffer);
-      await writeFile(path, body);
-      bytes = body.byteLength;
-    } else {
-      // Native files can be arbitrarily large; stream directly to disk.
-      const res = await drive.files.get(
-        { supportsAllDrives: true, fileId, alt: "media" },
-        { responseType: "stream" }
-      );
-      await pipeline(res.data as Readable, createWriteStream(path));
-      bytes = (await stat(path)).size;
+    try {
+      if (isWorkspace) {
+        // Workspace exports are bounded by Google (~10MB Doc export cap); buffer is fine.
+        const res = await drive.files.export(
+          { fileId, mimeType: outMime },
+          { responseType: "arraybuffer" }
+        );
+        const body = Buffer.from(res.data as ArrayBuffer);
+        await writeFile(path, body);
+        bytes = body.byteLength;
+      } else {
+        // Native files can be arbitrarily large; stream directly to disk.
+        const res = await drive.files.get(
+          { supportsAllDrives: true, fileId, alt: "media" },
+          { responseType: "stream" }
+        );
+        await pipeline(res.data as Readable, createWriteStream(path));
+        bytes = (await stat(path)).size;
+      }
+    } catch (err) {
+      // Download failed mid-flight (network error, stream interruption,
+      // export rejection). Remove any partial file before propagating so
+      // callers don't see a path that points at corrupt/incomplete bytes.
+      await unlink(path).catch(() => {});
+      throw err;
     }
 
     return textResult({
