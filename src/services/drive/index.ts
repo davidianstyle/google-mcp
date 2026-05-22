@@ -16,15 +16,27 @@ import type { Readable } from "node:stream";
 const DOWNLOAD_CACHE_DIR = join(tmpdir(), "google-mcp");
 const DOWNLOAD_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
-// One-shot cleanup of stale downloads, run on first use per process.
-// Removes files in DOWNLOAD_CACHE_DIR older than DOWNLOAD_CACHE_TTL_MS so
-// long-running MCP servers don't accumulate downloads indefinitely.
-// Best-effort: any IO error is swallowed since cleanup is non-essential.
-let cacheCleanupDone = false;
-async function cleanupStaleDownloads(): Promise<void> {
-  if (cacheCleanupDone) return;
-  cacheCleanupDone = true;
-  try {
+// Output MIME types we treat as text in inline mode. Everything else is
+// returned as base64 to avoid corrupting binary bytes through UTF-8.
+// Workspace files can be exported as text (markdown/csv/html) OR as
+// binary (PDF/DOCX/XLSX), so the source format doesn't determine
+// encoding — the OUTPUT MIME does.
+function isTextMime(mime: string): boolean {
+  return mime.startsWith("text/") || mime === "application/json";
+}
+
+// One-shot initialization of the cache dir: ensures the directory exists
+// and sweeps stale (>24h old) entries. Runs at most once per process per
+// successful completion. If init fails, the cached promise is cleared so
+// the next call can retry. Per-entry cleanup errors are swallowed (a
+// missing file or permission glitch on one entry shouldn't block init),
+// but a top-level mkdir/readdir failure rejects and resets so callers
+// see the real error and the next call gets a fresh attempt.
+let cacheInitPromise: Promise<void> | null = null;
+function ensureCacheInitialized(): Promise<void> {
+  if (cacheInitPromise) return cacheInitPromise;
+  cacheInitPromise = (async () => {
+    await mkdir(DOWNLOAD_CACHE_DIR, { recursive: true });
     const entries = await readdir(DOWNLOAD_CACHE_DIR);
     const cutoff = Date.now() - DOWNLOAD_CACHE_TTL_MS;
     await Promise.all(
@@ -34,13 +46,15 @@ async function cleanupStaleDownloads(): Promise<void> {
           const s = await stat(path);
           if (s.isFile() && s.mtimeMs < cutoff) await unlink(path);
         } catch {
-          // Ignore — entry may have been removed concurrently, or a permission issue.
+          // Entry was removed concurrently or otherwise inaccessible. Ignore.
         }
       })
     );
-  } catch {
-    // Cache dir doesn't exist yet (first run) — nothing to clean.
-  }
+  })().catch((err) => {
+    cacheInitPromise = null;
+    throw err;
+  });
+  return cacheInitPromise;
 }
 
 const MIME_TO_EXT: Record<string, string> = {
@@ -230,10 +244,10 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     return textResult({ success: true, action: "trashed", fileId, fileName: file.data.name });
   });
 
-  server.tool("drive_download_file", "Download a file from Drive. Default writes to a local temp path and returns { name, mimeType, path, bytes }; caller uses Read/Bash on the path. Pass returnContent=true to skip disk and return the body inline as { name, mimeType, content, bytes, encoding } — Workspace exports as utf-8 text, native files as base64. Use inline mode only for small files where disk indirection is wasteful; for binary or large files prefer the default path mode. Files older than 24h in the cache dir are cleaned up on first use per process.", {
+  server.tool("drive_download_file", "Download a file from Drive. Default writes to a local temp path and returns { name, mimeType, path, bytes }; caller uses Read/Bash on the path. Pass returnContent=true to skip disk and return the body inline as { name, mimeType, content, bytes, encoding } where encoding is 'utf-8' for text MIME types (text/* and application/json) and 'base64' for everything else — including Workspace exports to binary formats like PDF/DOCX/XLSX. Use inline mode only for small files where disk indirection is wasteful; for binary or large files prefer the default path mode. Files older than 24h in the cache dir are cleaned up on first use per process.", {
     fileId: z.string(),
     mimeType: z.string().optional().describe("Export MIME type for Google Workspace files (e.g., 'text/markdown', 'text/plain', 'application/pdf')"),
-    returnContent: z.boolean().optional().default(false).describe("If true, return the file content inline (utf-8 for Workspace, base64 for binary) instead of writing to disk. Default false: write to disk and return a path."),
+    returnContent: z.boolean().optional().default(false).describe("If true, return the file content inline (utf-8 for text MIME, base64 otherwise) instead of writing to disk. Default false: write to disk and return a path."),
   }, async ({ fileId, mimeType, returnContent }) => {
     const drive = api();
     const meta = await drive.files.get({ supportsAllDrives: true, fileId, fields: "name,mimeType" });
@@ -244,38 +258,33 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
       : meta.data.mimeType || "application/octet-stream";
 
     // Inline mode: return body in the response, never touch disk.
+    // Encoding choice keys off the OUTPUT MIME, not the source format —
+    // Workspace docs can be exported to binary (PDF/DOCX) which MUST be
+    // base64 to preserve bytes.
     if (returnContent) {
-      if (isWorkspace) {
-        const res = await drive.files.export(
-          { fileId, mimeType: outMime },
-          { responseType: "arraybuffer" }
-        );
-        const body = Buffer.from(res.data as ArrayBuffer);
-        return textResult({
-          name: meta.data.name,
-          mimeType: outMime,
-          content: body.toString("utf-8"),
-          bytes: body.byteLength,
-          encoding: "utf-8",
-        });
-      }
-      const res = await drive.files.get(
-        { supportsAllDrives: true, fileId, alt: "media" },
-        { responseType: "arraybuffer" }
-      );
-      const body = Buffer.from(res.data as ArrayBuffer);
+      const arraybufRes = isWorkspace
+        ? await drive.files.export(
+            { fileId, mimeType: outMime },
+            { responseType: "arraybuffer" }
+          )
+        : await drive.files.get(
+            { supportsAllDrives: true, fileId, alt: "media" },
+            { responseType: "arraybuffer" }
+          );
+      const body = Buffer.from(arraybufRes.data as ArrayBuffer);
+      const encoding: "utf-8" | "base64" = isTextMime(outMime) ? "utf-8" : "base64";
       return textResult({
         name: meta.data.name,
         mimeType: outMime,
-        content: body.toString("base64"),
+        content: body.toString(encoding),
         bytes: body.byteLength,
-        encoding: "base64",
+        encoding,
       });
     }
 
-    // Disk mode (default): write to a temp path and return the path.
-    await cleanupStaleDownloads();
-    await mkdir(DOWNLOAD_CACHE_DIR, { recursive: true });
+    // Disk mode (default): ensure cache dir is initialized (with stale-file
+    // sweep), then write to a temp path and return it.
+    await ensureCacheInitialized();
 
     const ext = extensionFor(outMime);
     const safeName = safeFileName(meta.data.name || fileId);
