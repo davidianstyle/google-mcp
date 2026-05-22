@@ -126,12 +126,20 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
   server.tool("drive_move_file", "Move a file to a different folder", {
     fileId: z.string(),
     newParentId: z.string().describe("Destination folder ID. Use 'root' for top-level."),
-    removeFromAllParents: z.boolean().optional().default(false),
+    removeFromAllParents: z.boolean().optional().default(false).describe("Remove the file from all current parents. Always treated as true for Shared Drive items, which can only have one parent."),
   }, async ({ fileId, newParentId, removeFromAllParents }) => {
     const drive = api();
+    // Always fetch parents + driveId. Shared Drive items can only have one
+    // parent, so adding a new parent without removing the existing one
+    // will fail. Force-remove existing parents on Shared Drive items.
+    const file = await drive.files.get({
+      supportsAllDrives: true,
+      fileId,
+      fields: "parents,driveId",
+    });
+    const isSharedDrive = !!file.data.driveId;
     let removeParents: string | undefined;
-    if (removeFromAllParents) {
-      const file = await drive.files.get({ supportsAllDrives: true, fileId, fields: "parents" });
+    if (removeFromAllParents || isSharedDrive) {
       removeParents = file.data.parents?.join(",");
     }
     const res = await drive.files.update({
