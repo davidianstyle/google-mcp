@@ -39,6 +39,8 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
 
     const order = `${orderBy} ${sortDirection === "asc" ? "" : "desc"}`.trim();
     const res = await api().files.list({
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
       q: qParts.join(" and "),
       pageSize: maxResults,
       orderBy: order,
@@ -59,6 +61,8 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
 
     if (includeSubfolders) {
       const fRes = await drive.files.list({
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
         q: `'${folderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
         pageSize: maxResults,
         orderBy: "name",
@@ -69,6 +73,8 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
 
     if (includeFiles) {
       const fRes = await drive.files.list({
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
         q: `'${folderId}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false`,
         pageSize: maxResults,
         orderBy: "name",
@@ -100,6 +106,8 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     if (modifiedAfter) qParts.push(`modifiedTime > '${modifiedAfter}'`);
 
     const res = await api().files.list({
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
       q: qParts.join(" and "),
       pageSize: maxResults,
       pageToken,
@@ -118,15 +126,24 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
   server.tool("drive_move_file", "Move a file to a different folder", {
     fileId: z.string(),
     newParentId: z.string().describe("Destination folder ID. Use 'root' for top-level."),
-    removeFromAllParents: z.boolean().optional().default(false),
+    removeFromAllParents: z.boolean().optional().default(false).describe("Remove the file from all current parents. Always treated as true for Shared Drive items, which can only have one parent."),
   }, async ({ fileId, newParentId, removeFromAllParents }) => {
     const drive = api();
+    // Always fetch parents + driveId. Shared Drive items can only have one
+    // parent, so adding a new parent without removing the existing one
+    // will fail. Force-remove existing parents on Shared Drive items.
+    const file = await drive.files.get({
+      supportsAllDrives: true,
+      fileId,
+      fields: "parents,driveId",
+    });
+    const isSharedDrive = !!file.data.driveId;
     let removeParents: string | undefined;
-    if (removeFromAllParents) {
-      const file = await drive.files.get({ fileId, fields: "parents" });
+    if (removeFromAllParents || isSharedDrive) {
       removeParents = file.data.parents?.join(",");
     }
     const res = await drive.files.update({
+      supportsAllDrives: true,
       fileId,
       addParents: newParentId,
       removeParents,
@@ -141,6 +158,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     parentId: z.string().optional().describe("Destination folder ID"),
   }, async ({ fileId, name, parentId }) => {
     const res = await api().files.copy({
+      supportsAllDrives: true,
       fileId,
       requestBody: { name, parents: parentId ? [parentId] : undefined },
       fields: "id,name,webViewLink",
@@ -152,7 +170,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     fileId: z.string(),
     newName: z.string(),
   }, async ({ fileId, newName }) => {
-    const res = await api().files.update({ fileId, requestBody: { name: newName }, fields: "id,name" });
+    const res = await api().files.update({ supportsAllDrives: true, fileId, requestBody: { name: newName }, fields: "id,name" });
     return textResult({ id: res.data.id, name: res.data.name });
   });
 
@@ -162,11 +180,11 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
   }, async ({ fileId, permanent }) => {
     const drive = api();
     if (permanent) {
-      await drive.files.delete({ fileId });
+      await drive.files.delete({ supportsAllDrives: true, fileId });
       return textResult({ success: true, action: "deleted", fileId });
     }
-    await drive.files.update({ fileId, requestBody: { trashed: true } });
-    const file = await drive.files.get({ fileId, fields: "id,name" });
+    await drive.files.update({ supportsAllDrives: true, fileId, requestBody: { trashed: true } });
+    const file = await drive.files.get({ supportsAllDrives: true, fileId, fields: "id,name" });
     return textResult({ success: true, action: "trashed", fileId, fileName: file.data.name });
   });
 
@@ -192,6 +210,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     parentId: z.string().optional().describe("Parent folder ID"),
   }, async ({ name, parentId }) => {
     const res = await api().files.create({
+      supportsAllDrives: true,
       requestBody: {
         name,
         mimeType: "application/vnd.google-apps.folder",
@@ -206,8 +225,10 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     folderId: z.string(),
   }, async ({ folderId }) => {
     const drive = api();
-    const meta = await drive.files.get({ fileId: folderId, fields: "id,name,modifiedTime,createdTime,owners,webViewLink" });
+    const meta = await drive.files.get({ supportsAllDrives: true, fileId: folderId, fields: "id,name,modifiedTime,createdTime,owners,webViewLink" });
     const children = await drive.files.list({
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
       q: `'${folderId}' in parents and trashed = false`,
       fields: "files(id)",
       pageSize: 1000,
