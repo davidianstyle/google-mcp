@@ -205,12 +205,11 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     const existing = await cal.events.get({ calendarId, eventId });
     const attendees = existing.data.attendees || [];
     let me = attendees.find((a) => a.self);
-    if (!me) {
+    if (!me && calendarId !== "primary") {
       const primary = await cal.calendarList.get({ calendarId: "primary" });
-      const myEmail = primary.data.id;
+      const myEmail = primary.data.id?.toLowerCase();
       if (myEmail) {
-        const myEmailLower = myEmail.toLowerCase();
-        me = attendees.find((a) => a.email?.toLowerCase() === myEmailLower);
+        me = attendees.find((a) => a.email?.toLowerCase() === myEmail);
       }
     }
     if (!me) {
