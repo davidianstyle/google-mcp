@@ -210,8 +210,8 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
       if (existing.data.creator?.self && existing.data.creator.email) {
         myEmail = existing.data.creator.email;
       } else if (existing.data.organizer?.self && existing.data.organizer.email) {
-        const orgEmail = existing.data.organizer.email;
-        if (!orgEmail.endsWith("@group.calendar.google.com") && !orgEmail.endsWith("@resource.calendar.google.com")) {
+        const orgEmail = existing.data.organizer.email.toLowerCase();
+        if (!orgEmail.endsWith(".calendar.google.com")) {
           myEmail = orgEmail;
         }
       }
