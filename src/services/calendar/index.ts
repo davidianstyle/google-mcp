@@ -208,7 +208,10 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     if (!me) {
       const primary = await cal.calendarList.get({ calendarId: "primary" });
       const myEmail = primary.data.id;
-      if (myEmail) me = attendees.find((a) => a.email === myEmail);
+      if (myEmail) {
+        const myEmailLower = myEmail.toLowerCase();
+        me = attendees.find((a) => a.email?.toLowerCase() === myEmailLower);
+      }
     }
     if (!me) {
       throw new Error(`Cannot respond: authenticated user is not an attendee of event ${eventId}`);
