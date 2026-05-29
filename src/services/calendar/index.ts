@@ -206,10 +206,26 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     const attendees = existing.data.attendees || [];
     let me = attendees.find((a) => a.self);
     if (!me) {
-      const primary = await cal.calendarList.get({ calendarId: "primary" });
-      const myEmail = primary.data.id?.toLowerCase();
+      let myEmail: string | undefined;
+      if (existing.data.creator?.self && existing.data.creator.email) {
+        myEmail = existing.data.creator.email;
+      } else if (existing.data.organizer?.self && existing.data.organizer.email) {
+        const orgEmail = existing.data.organizer.email;
+        if (!orgEmail.endsWith("@group.calendar.google.com") && !orgEmail.endsWith("@resource.calendar.google.com")) {
+          myEmail = orgEmail;
+        }
+      }
+      if (!myEmail) {
+        try {
+          const primary = await cal.calendarList.get({ calendarId: "primary" });
+          myEmail = primary.data.id || undefined;
+        } catch {
+          // calendarList scope not granted; fall through to "not an attendee" error.
+        }
+      }
       if (myEmail) {
-        me = attendees.find((a) => a.email?.toLowerCase() === myEmail);
+        const target = myEmail.toLowerCase();
+        me = attendees.find((a) => a.email?.toLowerCase() === target);
       }
     }
     if (!me) {
