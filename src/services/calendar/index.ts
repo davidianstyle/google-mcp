@@ -25,6 +25,26 @@ function formatEvent(e: calendar_v3.Schema$Event): Record<string, unknown> {
   };
 }
 
+function summarizeAttendee(a: calendar_v3.Schema$EventAttendee): { email: string | undefined; responseStatus: string | undefined } {
+  return { email: a.email ?? undefined, responseStatus: a.responseStatus ?? undefined };
+}
+
+/**
+ * List-context event formatter: always trims attendees down to
+ * email+responseStatus (full attendee objects carry displayName, organizer/
+ * optional/resource flags, comment, etc. that a list view rarely needs), and
+ * omits conferenceData unless includeDetails is true (it's a sizeable nested
+ * object — entry points, phone numbers, notes — that's mostly only useful
+ * when looking at one specific event).
+ */
+export function formatEventForList(e: calendar_v3.Schema$Event, includeDetails: boolean): Record<string, unknown> {
+  return {
+    ...formatEvent(e),
+    attendees: e.attendees?.map(summarizeAttendee),
+    conferenceData: includeDetails ? e.conferenceData : undefined,
+  };
+}
+
 // Matches a trailing "Z" or "+HH:MM"/"-HH:MM" UTC offset on an ISO 8601
 // dateTime string, meaning the timestamp is already unambiguous and doesn't
 // need a timeZone field to be interpreted correctly.
@@ -46,10 +66,31 @@ async function getCalendarTimeZone(cal: calendar_v3.Calendar, calendarId: string
   return timeZone;
 }
 
+// Caches the authenticated user's own primary-calendar email for the
+// lifetime of the process. calendar_respond_to_event only needs this as a
+// fallback (an event where the user isn't flagged `self` on any attendee),
+// and the answer can't change mid-process, so one calendarList.get call
+// covers every subsequent respond call. Caches a failed/ungranted lookup too
+// (as undefined) rather than re-attempting a doomed call every time.
+let cachedPrimaryEmail: string | undefined;
+let primaryEmailFetched = false;
+async function getPrimaryEmail(cal: calendar_v3.Calendar): Promise<string | undefined> {
+  if (primaryEmailFetched) return cachedPrimaryEmail;
+  try {
+    const primary = await cal.calendarList.get({ calendarId: "primary" });
+    cachedPrimaryEmail = primary.data.id?.toLowerCase() || undefined;
+  } catch {
+    // calendarList scope not granted; cache the miss so we don't retry every call.
+    cachedPrimaryEmail = undefined;
+  }
+  primaryEmailFetched = true;
+  return cachedPrimaryEmail;
+}
+
 const ALL_DAY_END_NOTE = "For all-day events, use a 'YYYY-MM-DD' date (no time). The end date is exclusive — a single-day event on 2026-06-22 has start '2026-06-22' and end '2026-06-23'.";
 
 export function registerCalendarTools(server: McpServer, ctx: ServiceContext): void {
-  const api = () => google.calendar({ version: "v3", auth: ctx.auth });
+  const api = google.calendar({ version: "v3", auth: ctx.auth });
 
   server.tool("calendar_list_events", "List events from a calendar within a time range", {
     calendarId: z.string().describe("Calendar ID (use 'primary' for main calendar)"),
@@ -57,15 +98,21 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     timeMax: z.string().optional().describe("End of time range (ISO 8601)"),
     timeZone: z.string().optional().describe("IANA timezone (e.g., 'America/New_York')"),
     maxResults: z.number().optional().describe("Maximum events to return"),
-  }, async ({ calendarId, timeMin, timeMax, timeZone, maxResults }) => {
-    const res = await api().events.list({
+    pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
+    includeDetails: z.boolean().optional().default(false).describe("Include full conferenceData per event. Default false always trims attendees to email+responseStatus and omits conferenceData to keep list responses small."),
+  }, async ({ calendarId, timeMin, timeMax, timeZone, maxResults, pageToken, includeDetails }) => {
+    const res = await api.events.list({
       calendarId,
       timeMin, timeMax, timeZone,
       maxResults: maxResults || 50,
+      pageToken,
       singleEvents: true,
       orderBy: "startTime",
     });
-    return textResult(res.data.items?.map(formatEvent) || []);
+    return textResult({
+      events: res.data.items?.map((e) => formatEventForList(e, includeDetails)) || [],
+      nextPageToken: res.data.nextPageToken,
+    });
   });
 
   server.tool("calendar_create_event", "Create a new calendar event", {
@@ -93,7 +140,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     transparency: z.enum(["opaque", "transparent"]).optional(),
     colorId: z.string().optional(),
   }, async (opts) => {
-    const cal = api();
+    const cal = api;
     const isAllDay = !opts.start.includes("T");
     let timeZone = opts.timeZone;
     if (!isAllDay && !timeZone && !hasExplicitOffset(opts.start) && !hasExplicitOffset(opts.end)) {
@@ -136,7 +183,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
       timeZone: z.string().optional(),
     })),
   }, async ({ calendarId, events }) => {
-    const cal = api();
+    const cal = api;
     const settled = await Promise.allSettled(events.map(async (evt) => {
       const isAllDay = !evt.start.includes("T");
       const res = await cal.events.insert({
@@ -170,7 +217,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     calendarId: z.string(),
     eventId: z.string(),
   }, async ({ calendarId, eventId }) => {
-    const res = await api().events.get({ calendarId, eventId });
+    const res = await api.events.get({ calendarId, eventId });
     return textResult(formatEvent(res.data ));
   });
 
@@ -187,7 +234,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     sendUpdates: z.enum(["all", "externalOnly", "none"]).optional(),
     colorId: z.string().optional(),
   }, async (opts) => {
-    const cal = api();
+    const cal = api;
     const requestBody: calendar_v3.Schema$Event = {};
 
     if (opts.summary !== undefined) requestBody.summary = opts.summary;
@@ -236,7 +283,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     eventId: z.string(),
     sendUpdates: z.enum(["all", "externalOnly", "none"]).optional(),
   }, async ({ calendarId, eventId, sendUpdates }) => {
-    await api().events.delete({ calendarId, eventId, sendUpdates });
+    await api.events.delete({ calendarId, eventId, sendUpdates });
     return textResult({ success: true, eventId });
   });
 
@@ -245,12 +292,17 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     query: z.string().describe("Free text search terms"),
     timeMin: z.string().optional(),
     timeMax: z.string().optional(),
-  }, async ({ calendarId, query, timeMin, timeMax }) => {
-    const res = await api().events.list({
+    pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
+  }, async ({ calendarId, query, timeMin, timeMax, pageToken }) => {
+    const res = await api.events.list({
       calendarId, q: query, timeMin, timeMax,
       singleEvents: true, orderBy: "startTime", maxResults: 25,
+      pageToken,
     });
-    return textResult(res.data.items?.map(formatEvent) || []);
+    return textResult({
+      events: res.data.items?.map(formatEvent) || [],
+      nextPageToken: res.data.nextPageToken,
+    });
   });
 
   server.tool("calendar_respond_to_event", "Respond to a calendar event invitation", {
@@ -259,19 +311,14 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     responseStatus: z.enum(["accepted", "declined", "tentative"]),
     sendUpdates: z.enum(["all", "externalOnly", "none"]).optional(),
   }, async ({ calendarId, eventId, responseStatus, sendUpdates }) => {
-    const cal = api();
+    const cal = api;
     const existing = await cal.events.get({ calendarId, eventId });
     const attendees = existing.data.attendees || [];
     let me = attendees.find((a) => a.self);
     if (!me) {
-      try {
-        const primary = await cal.calendarList.get({ calendarId: "primary" });
-        const myEmail = primary.data.id?.toLowerCase();
-        if (myEmail) {
-          me = attendees.find((a) => a.email?.toLowerCase() === myEmail);
-        }
-      } catch {
-        // calendarList scope not granted; fall through to "not an attendee" error.
+      const myEmail = await getPrimaryEmail(cal);
+      if (myEmail) {
+        me = attendees.find((a) => a.email?.toLowerCase() === myEmail);
       }
     }
     if (!me) {
@@ -292,7 +339,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     calendarIds: z.array(z.string()).describe("Calendar IDs to check"),
     timeZone: z.string().optional(),
   }, async ({ timeMin, timeMax, calendarIds, timeZone }) => {
-    const res = await api().freebusy.query({
+    const res = await api.freebusy.query({
       requestBody: {
         timeMin, timeMax, timeZone,
         items: calendarIds.map((id) => ({ id })),
@@ -302,14 +349,14 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
   });
 
   server.tool("calendar_list_calendars", "List all calendars", {}, async () => {
-    const res = await api().calendarList.list();
+    const res = await api.calendarList.list();
     return textResult(res.data.items?.map((c) => ({
       id: c.id, summary: c.summary, primary: c.primary, accessRole: c.accessRole, timeZone: c.timeZone,
     })) || []);
   });
 
   server.tool("calendar_list_colors", "List available event and calendar colors", {}, async () => {
-    const res = await api().colors.get();
+    const res = await api.colors.get();
     return textResult({ event: res.data.event, calendar: res.data.calendar });
   });
 
