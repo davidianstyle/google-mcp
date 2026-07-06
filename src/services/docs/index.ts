@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { google, docs_v1 } from "googleapis";
+import { google, docs_v1, drive_v3 } from "googleapis";
 import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
@@ -23,6 +23,30 @@ function extractPlainText(body: docs_v1.Schema$Body | undefined): string {
     }
   }
   return text;
+}
+
+function findTab(tabs: docs_v1.Schema$Tab[] | undefined, tabId: string): docs_v1.Schema$Tab | undefined {
+  for (const tab of tabs || []) {
+    if (tab.tabProperties?.tabId === tabId) return tab;
+    const found = findTab(tab.childTabs, tabId);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/**
+ * Picks which tab's body to read. Requires includeTabsContent: true on the
+ * documents.get call, since that's what populates tab.documentTab.body
+ * (without it, tabs only carry tabProperties, not content).
+ */
+function selectTabBody(doc: docs_v1.Schema$Document, tabId: string | undefined): docs_v1.Schema$Body | undefined {
+  const tabs = doc.tabs;
+  if (!tabs?.length) return doc.body;
+  if (tabId) {
+    const tab = findTab(tabs, tabId);
+    if (tab?.documentTab?.body) return tab.documentTab.body;
+  }
+  return tabs[0]?.documentTab?.body;
 }
 
 function extractMarkdown(body: docs_v1.Schema$Body | undefined): string {
@@ -65,13 +89,15 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string().describe("Document ID from the URL"),
     format: z.enum(["text", "markdown", "json"]).optional().default("text"),
     maxLength: z.number().optional(),
-    tabId: z.string().optional(),
-  }, async ({ documentId, format, maxLength }) => {
-    const doc = await docsApi().documents.get({ documentId });
-    let content: string;
+    tabId: z.string().optional().describe("Read only this tab's content (see docs_list_tabs for tab IDs). Defaults to the document's first tab."),
+  }, async ({ documentId, format, maxLength, tabId }) => {
+    const doc = await docsApi().documents.get({ documentId, includeTabsContent: true });
     if (format === "json") return textResult(doc.data);
-    if (format === "markdown") content = extractMarkdown(doc.data.body);
-    else content = extractPlainText(doc.data.body);
+
+    const body = selectTabBody(doc.data, tabId);
+    let content: string;
+    if (format === "markdown") content = extractMarkdown(body);
+    else content = extractPlainText(body);
     if (maxLength && content.length > maxLength) content = content.slice(0, maxLength);
     return textResult(`Content (${content.length} characters):\n${content}`);
   });
@@ -252,7 +278,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
 
     const doc = await docs.documents.get({ documentId });
     const tables = doc.data.body?.content?.filter((e) => e.table) || [];
-    const table = tables.at(-1)?.table;
+    const table = tables.find((t) => t.startIndex === index)?.table;
     if (!table?.tableRows) return textResult({ success: true, note: "Table inserted but could not populate" });
 
     const requests: docs_v1.Schema$Request[] = [];
@@ -334,19 +360,52 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     tableIndex: z.number(),
     rows: z.array(z.array(z.string())),
   }, async ({ documentId, tableIndex, rows }) => {
+    if (rows.length === 0) return textResult({ success: true, rowsAdded: 0 });
+
     const docs = docsApi();
     const doc = await docs.documents.get({ documentId });
     const tables = doc.data.body?.content?.filter((e) => e.table) || [];
     if (tableIndex >= tables.length) return textResult({ error: "Table not found" });
 
-    const table = tables[tableIndex];
-    const tableEnd = table.endIndex! - 1;
+    const tableElement = tables[tableIndex];
+    const tableStartIndex = tableElement.startIndex!;
+    const existingRowCount = tableElement.table!.rows!;
+    if (existingRowCount < 1) return textResult({ error: "Table has no rows to anchor the insertion to" });
 
-    const requests: docs_v1.Schema$Request[] = [];
-    for (const _row of rows) {
-      requests.push({ insertTableRow: { tableCellLocation: { tableStartLocation: { index: table.startIndex! }, rowIndex: table.table!.rows! }, insertBelow: true } });
+    // Insert `rows.length` empty rows, each anchored below the previous
+    // last row (existingRowCount - 1 + i), so they land in order at the
+    // end of the table.
+    const insertRequests: docs_v1.Schema$Request[] = rows.map((_row, i) => ({
+      insertTableRow: {
+        tableCellLocation: {
+          tableStartLocation: { index: tableStartIndex },
+          rowIndex: existingRowCount - 1 + i,
+        },
+        insertBelow: true,
+      },
+    }));
+    await docs.documents.batchUpdate({ documentId, requestBody: { requests: insertRequests } });
+
+    // Re-fetch to get the real cell start indexes for the newly inserted
+    // (empty) rows, then populate them.
+    const updatedDoc = await docs.documents.get({ documentId });
+    const updatedTables = updatedDoc.data.body?.content?.filter((e) => e.table) || [];
+    const updatedTableRows = updatedTables.find((t) => t.startIndex === tableStartIndex)?.table?.tableRows || [];
+
+    const textRequests: docs_v1.Schema$Request[] = [];
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const tableRow = updatedTableRows[existingRowCount + i];
+      const cells = tableRow?.tableCells || [];
+      for (let c = cells.length - 1; c >= 0; c--) {
+        const cellText = rows[i][c];
+        const cellStartIndex = cells[c].content?.[0]?.startIndex;
+        if (cellText && cellStartIndex !== undefined) {
+          textRequests.push({ insertText: { text: cellText, location: { index: cellStartIndex } } });
+        }
+      }
     }
-    await docs.documents.batchUpdate({ documentId, requestBody: { requests } });
+    if (textRequests.length) await docs.documents.batchUpdate({ documentId, requestBody: { requests: textRequests } });
+
     return textResult({ success: true, rowsAdded: rows.length });
   });
 
@@ -519,23 +578,6 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     return textResult({ success: true });
   });
 
-  server.tool("docs_add_tab", "Add a new tab to the document", {
-    documentId: z.string(),
-    title: z.string().optional(),
-  }, async ({ documentId, title }) => {
-    // Tabs are managed via the Drive API / Docs API tab support
-    // For now, this creates a section break as a conceptual "tab"
-    return textResult({ note: "Google Docs tab support requires the Docs API v1 tabs feature. Use docs_list_tabs to see existing tabs." });
-  });
-
-  server.tool("docs_rename_tab", "Rename a document tab", {
-    documentId: z.string(),
-    tabId: z.string(),
-    newTitle: z.string(),
-  }, async ({ documentId, tabId, newTitle }) => {
-    return textResult({ note: "Tab renaming requires Docs API v1 tabs support." });
-  });
-
   server.tool("docs_list_tabs", "List all tabs in a document", {
     documentId: z.string(),
   }, async ({ documentId }) => {
@@ -572,12 +614,21 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     includeDeleted: z.boolean().optional().default(false),
   }, async ({ documentId, includeDeleted }) => {
-    const res = await driveApi().comments.list({
-      fileId: documentId,
-      includeDeleted,
-      fields: "comments(id,content,author,createdTime,resolved,quotedFileContent)",
-    });
-    return textResult(res.data.comments || []);
+    const drive = driveApi();
+    const comments: drive_v3.Schema$Comment[] = [];
+    let pageToken: string | undefined;
+    do {
+      const res = await drive.comments.list({
+        fileId: documentId,
+        includeDeleted,
+        pageSize: 100,
+        pageToken,
+        fields: "nextPageToken,comments(id,content,author,createdTime,resolved,quotedFileContent)",
+      });
+      comments.push(...(res.data.comments || []));
+      pageToken = res.data.nextPageToken || undefined;
+    } while (pageToken);
+    return textResult(comments);
   });
 
   server.tool("docs_reply_to_comment", "Reply to a comment", {
