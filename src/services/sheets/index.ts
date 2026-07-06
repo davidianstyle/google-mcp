@@ -4,17 +4,19 @@ import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
 import { parseA1Range } from "../../utils/a1.js";
+import { assertCellCountWithinCap, countCells } from "../../utils/sheets-guard.js";
 
 export function registerSheetsTools(server: McpServer, ctx: ServiceContext): void {
-  const api = () => google.sheets({ version: "v4", auth: ctx.auth });
-  const driveApi = () => google.drive({ version: "v3", auth: ctx.auth });
+  const api = google.sheets({ version: "v4", auth: ctx.auth });
+  const driveApi = google.drive({ version: "v3", auth: ctx.auth });
 
   server.tool("sheets_read", "Read data from a spreadsheet range", {
     spreadsheetId: z.string(),
     range: z.string().describe("A1 notation (e.g., 'Sheet1!A1:C10')"),
     valueRenderOption: z.enum(["FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA"]).optional().default("FORMATTED_VALUE"),
   }, async ({ spreadsheetId, range, valueRenderOption }) => {
-    const res = await api().spreadsheets.values.get({ spreadsheetId, range, valueRenderOption });
+    const res = await api.spreadsheets.values.get({ spreadsheetId, range, valueRenderOption });
+    assertCellCountWithinCap(countCells(res.data.values), range);
     return textResult({ range: res.data.range, values: res.data.values });
   });
 
@@ -24,7 +26,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     values: z.array(z.array(z.unknown())).describe("2D array of values"),
     valueInputOption: z.enum(["RAW", "USER_ENTERED"]).optional().default("USER_ENTERED"),
   }, async ({ spreadsheetId, range, values, valueInputOption }) => {
-    const res = await api().spreadsheets.values.update({
+    const res = await api.spreadsheets.values.update({
       spreadsheetId, range, valueInputOption,
       requestBody: { values },
     });
@@ -36,7 +38,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     data: z.array(z.object({ range: z.string(), values: z.array(z.array(z.unknown())) })),
     valueInputOption: z.enum(["RAW", "USER_ENTERED"]).optional().default("USER_ENTERED"),
   }, async ({ spreadsheetId, data, valueInputOption }) => {
-    const res = await api().spreadsheets.values.batchUpdate({
+    const res = await api.spreadsheets.values.batchUpdate({
       spreadsheetId,
       requestBody: { valueInputOption, data },
     });
@@ -48,7 +50,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     sheetTitles: z.array(z.string()).optional().describe("Names of initial sheets"),
   }, async ({ title, sheetTitles }) => {
     const sheets = sheetTitles?.map((t) => ({ properties: { title: t } }));
-    const res = await api().spreadsheets.create({
+    const res = await api.spreadsheets.create({
       requestBody: { properties: { title }, sheets },
     });
     return textResult({
@@ -61,7 +63,10 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
   server.tool("sheets_get_info", "Get spreadsheet metadata", {
     spreadsheetId: z.string(),
   }, async ({ spreadsheetId }) => {
-    const res = await api().spreadsheets.get({ spreadsheetId });
+    const res = await api.spreadsheets.get({
+      spreadsheetId,
+      fields: "spreadsheetId,spreadsheetUrl,properties.title,sheets.properties(sheetId,title,gridProperties.rowCount,gridProperties.columnCount)",
+    });
     return textResult({
       spreadsheetId: res.data.spreadsheetId,
       title: res.data.properties?.title,
@@ -77,14 +82,21 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
 
   server.tool("sheets_list", "List spreadsheets in Drive", {
     maxResults: z.number().optional().default(20),
-  }, async ({ maxResults }) => {
-    const res = await driveApi().files.list({
+    pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
+  }, async ({ maxResults, pageToken }) => {
+    const res = await driveApi.files.list({
       q: "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
       pageSize: maxResults,
+      pageToken,
       orderBy: "modifiedTime desc",
-      fields: "files(id,name,modifiedTime,webViewLink)",
+      fields: "nextPageToken,files(id,name,modifiedTime,webViewLink)",
     });
-    return textResult(res.data.files || []);
+    return textResult({
+      files: res.data.files || [],
+      total: res.data.files?.length || 0,
+      hasMore: !!res.data.nextPageToken,
+      nextPageToken: res.data.nextPageToken,
+    });
   });
 
   server.tool("sheets_add_sheet", "Add a new sheet (tab) to a spreadsheet", {
@@ -93,7 +105,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     rowCount: z.number().optional(),
     columnCount: z.number().optional(),
   }, async ({ spreadsheetId, title, rowCount, columnCount }) => {
-    const res = await api().spreadsheets.batchUpdate({
+    const res = await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
         requests: [{ addSheet: { properties: { title, gridProperties: { rowCount: rowCount || 1000, columnCount: columnCount || 26 } } } }],
@@ -107,7 +119,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     spreadsheetId: z.string(),
     sheetId: z.number().describe("Sheet ID (not the sheet name)"),
   }, async ({ spreadsheetId, sheetId }) => {
-    await api().spreadsheets.batchUpdate({
+    await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: { requests: [{ deleteSheet: { sheetId } }] },
     });
@@ -119,7 +131,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     sheetId: z.number(),
     newTitle: z.string(),
   }, async ({ spreadsheetId, sheetId, newTitle }) => {
-    await api().spreadsheets.batchUpdate({
+    await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
         requests: [{ updateSheetProperties: { properties: { sheetId, title: newTitle }, fields: "title" } }],
@@ -134,7 +146,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     newTitle: z.string().optional(),
     insertIndex: z.number().optional(),
   }, async ({ spreadsheetId, sheetId, newTitle, insertIndex }) => {
-    const res = await api().spreadsheets.batchUpdate({
+    const res = await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
         requests: [{ duplicateSheet: { sourceSheetId: sheetId, newSheetName: newTitle, insertSheetIndex: insertIndex } }],
@@ -150,7 +162,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     values: z.array(z.array(z.unknown())),
     valueInputOption: z.enum(["RAW", "USER_ENTERED"]).optional().default("USER_ENTERED"),
   }, async ({ spreadsheetId, range, values, valueInputOption }) => {
-    const res = await api().spreadsheets.values.append({
+    const res = await api.spreadsheets.values.append({
       spreadsheetId, range, valueInputOption,
       requestBody: { values },
     });
@@ -161,7 +173,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     spreadsheetId: z.string(),
     range: z.string(),
   }, async ({ spreadsheetId, range }) => {
-    const res = await api().spreadsheets.values.clear({ spreadsheetId, range });
+    const res = await api.spreadsheets.values.clear({ spreadsheetId, range });
     return textResult({ clearedRange: res.data.clearedRange });
   });
 
@@ -172,7 +184,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     startIndex: z.number(),
     endIndex: z.number(),
   }, async ({ spreadsheetId, sheetId, dimension, startIndex, endIndex }) => {
-    await api().spreadsheets.batchUpdate({
+    await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
         requests: [{ deleteDimension: { range: { sheetId, dimension, startIndex, endIndex } } }],
@@ -185,12 +197,15 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     spreadsheetId: z.string(),
     range: z.string(),
   }, async ({ spreadsheetId, range }) => {
-    const res = await api().spreadsheets.get({
+    const res = await api.spreadsheets.get({
       spreadsheetId,
       ranges: [range],
       includeGridData: true,
+      fields: "sheets.data.rowData.values(formattedValue,effectiveFormat)",
     });
     const grid = res.data.sheets?.[0]?.data?.[0];
+    const cellCount = (grid?.rowData || []).reduce((sum, row) => sum + (row.values?.length || 0), 0);
+    assertCellCountWithinCap(cellCount, range);
     const formats = grid?.rowData?.map((row) =>
       row.values?.map((cell) => ({
         value: cell.formattedValue,
@@ -237,7 +252,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
       fields.push("userEnteredFormat.numberFormat");
     }
 
-    await api().spreadsheets.batchUpdate({
+    await api.spreadsheets.batchUpdate({
       spreadsheetId: opts.spreadsheetId,
       requestBody: {
         requests: [{
@@ -267,7 +282,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
       : opts.type === "NUMBER_GREATER" ? "NUMBER_GREATER"
       : opts.type === "NUMBER_LESS" ? "NUMBER_LESS" : "TEXT_CONTAINS";
 
-    await api().spreadsheets.batchUpdate({
+    await api.spreadsheets.batchUpdate({
       spreadsheetId: opts.spreadsheetId,
       requestBody: {
         requests: [{
@@ -294,7 +309,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     endIndex: z.number(),
     pixelSize: z.number(),
   }, async ({ spreadsheetId, sheetId, startIndex, endIndex, pixelSize }) => {
-    await api().spreadsheets.batchUpdate({
+    await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
         requests: [{
@@ -315,7 +330,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     startIndex: z.number().optional().default(0),
     endIndex: z.number().optional(),
   }, async ({ spreadsheetId, sheetId, startIndex, endIndex }) => {
-    await api().spreadsheets.batchUpdate({
+    await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
         requests: [{
@@ -339,7 +354,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     if (frozenRowCount !== undefined) { gridProperties.frozenRowCount = frozenRowCount; fields.push("gridProperties.frozenRowCount"); }
     if (frozenColumnCount !== undefined) { gridProperties.frozenColumnCount = frozenColumnCount; fields.push("gridProperties.frozenColumnCount"); }
 
-    await api().spreadsheets.batchUpdate({
+    await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
         requests: [{ updateSheetProperties: { properties: { sheetId, gridProperties }, fields: fields.join(",") } }],
@@ -358,7 +373,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     values: z.array(z.string()).describe("Allowed dropdown values"),
     strict: z.boolean().optional().default(true).describe("Reject input not in the list"),
   }, async (opts) => {
-    await api().spreadsheets.batchUpdate({
+    await api.spreadsheets.batchUpdate({
       spreadsheetId: opts.spreadsheetId,
       requestBody: {
         requests: [{
@@ -382,7 +397,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     startIndex: z.number(),
     endIndex: z.number(),
   }, async ({ spreadsheetId, sheetId, startIndex, endIndex }) => {
-    await api().spreadsheets.batchUpdate({
+    await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
         requests: [{
@@ -397,11 +412,11 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     spreadsheetId: z.string(),
     sheetId: z.number(),
   }, async ({ spreadsheetId, sheetId }) => {
-    const info = await api().spreadsheets.get({ spreadsheetId });
+    const info = await api.spreadsheets.get({ spreadsheetId, fields: "sheets.properties(sheetId,gridProperties.rowCount)" });
     const sheet = info.data.sheets?.find((s) => s.properties?.sheetId === sheetId);
     const rowCount = sheet?.properties?.gridProperties?.rowCount || 1000;
 
-    await api().spreadsheets.batchUpdate({
+    await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
         requests: [{
@@ -429,7 +444,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
 
     let dataSheetId = sheetId;
     if (parsed.sheetName) {
-      const info = await api().spreadsheets.get({
+      const info = await api.spreadsheets.get({
         spreadsheetId,
         fields: "sheets.properties(sheetId,title)",
       });
@@ -464,7 +479,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
       });
     }
 
-    const res = await api().spreadsheets.batchUpdate({
+    const res = await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
         requests: [{
@@ -492,7 +507,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     spreadsheetId: z.string(),
     chartId: z.number(),
   }, async ({ spreadsheetId, chartId }) => {
-    await api().spreadsheets.batchUpdate({
+    await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: { requests: [{ deleteEmbeddedObject: { objectId: chartId } }] },
     });
@@ -505,7 +520,7 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     markdown: z.string(),
   }, async ({ spreadsheetId, range, markdown }) => {
     const rows = markdown.split("\n").map((line) => [line]);
-    const res = await api().spreadsheets.values.update({
+    const res = await api.spreadsheets.values.update({
       spreadsheetId, range,
       valueInputOption: "RAW",
       requestBody: { values: rows },
