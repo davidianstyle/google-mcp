@@ -25,6 +25,29 @@ function formatEvent(e: calendar_v3.Schema$Event): Record<string, unknown> {
   };
 }
 
+// Matches a trailing "Z" or "+HH:MM"/"-HH:MM" UTC offset on an ISO 8601
+// dateTime string, meaning the timestamp is already unambiguous and doesn't
+// need a timeZone field to be interpreted correctly.
+const HAS_OFFSET_PATTERN = /(?:[Zz]|[+-]\d{2}:\d{2})$/;
+function hasExplicitOffset(dateTime: string): boolean {
+  return HAS_OFFSET_PATTERN.test(dateTime);
+}
+
+// Caches each calendar's default timeZone for the lifetime of the process,
+// so defaulting a timed event to "the calendar's own timezone" costs at
+// most one calendars.get per calendarId rather than one per create call.
+const calendarTimeZoneCache = new Map<string, string>();
+async function getCalendarTimeZone(cal: calendar_v3.Calendar, calendarId: string): Promise<string | undefined> {
+  const cached = calendarTimeZoneCache.get(calendarId);
+  if (cached) return cached;
+  const res = await cal.calendars.get({ calendarId, fields: "timeZone" });
+  const timeZone = res.data.timeZone || undefined;
+  if (timeZone) calendarTimeZoneCache.set(calendarId, timeZone);
+  return timeZone;
+}
+
+const ALL_DAY_END_NOTE = "For all-day events, use a 'YYYY-MM-DD' date (no time). The end date is exclusive — a single-day event on 2026-06-22 has start '2026-06-22' and end '2026-06-23'.";
+
 export function registerCalendarTools(server: McpServer, ctx: ServiceContext): void {
   const api = () => google.calendar({ version: "v3", auth: ctx.auth });
 
@@ -48,12 +71,12 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
   server.tool("calendar_create_event", "Create a new calendar event", {
     calendarId: z.string().describe("Calendar ID (use 'primary' for main calendar)"),
     summary: z.string().describe("Event title"),
-    start: z.string().describe("Start time (ISO 8601 datetime or date for all-day)"),
-    end: z.string().describe("End time (ISO 8601 datetime or date for all-day)"),
+    start: z.string().describe(`Start time (ISO 8601 datetime or date for all-day). ${ALL_DAY_END_NOTE}`),
+    end: z.string().describe(`End time (ISO 8601 datetime or date for all-day). ${ALL_DAY_END_NOTE}`),
     description: z.string().optional(),
     location: z.string().optional(),
     attendees: z.array(z.object({ email: z.string(), displayName: z.string().optional(), optional: z.boolean().optional() })).optional(),
-    timeZone: z.string().optional(),
+    timeZone: z.string().optional().describe("IANA timezone for a timed event. If omitted and start/end don't carry a UTC offset, defaults to the calendar's own timezone."),
     recurrence: z.array(z.string()).optional().describe("RFC5545 recurrence rules"),
     conferenceData: z.object({
       createRequest: z.object({
@@ -70,11 +93,16 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     transparency: z.enum(["opaque", "transparent"]).optional(),
     colorId: z.string().optional(),
   }, async (opts) => {
+    const cal = api();
     const isAllDay = !opts.start.includes("T");
-    const startField = isAllDay ? { date: opts.start } : { dateTime: opts.start, timeZone: opts.timeZone };
-    const endField = isAllDay ? { date: opts.end } : { dateTime: opts.end, timeZone: opts.timeZone };
+    let timeZone = opts.timeZone;
+    if (!isAllDay && !timeZone && !hasExplicitOffset(opts.start) && !hasExplicitOffset(opts.end)) {
+      timeZone = await getCalendarTimeZone(cal, opts.calendarId);
+    }
+    const startField = isAllDay ? { date: opts.start } : { dateTime: opts.start, timeZone };
+    const endField = isAllDay ? { date: opts.end } : { dateTime: opts.end, timeZone };
 
-    const res = await api().events.insert({
+    const res = await cal.events.insert({
       calendarId: opts.calendarId,
       conferenceDataVersion: opts.conferenceData ? 1 : undefined,
       sendUpdates: opts.sendUpdates,
@@ -150,37 +178,55 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     calendarId: z.string(),
     eventId: z.string(),
     summary: z.string().optional(),
-    start: z.string().optional(),
-    end: z.string().optional(),
+    start: z.string().optional().describe(`New start time (ISO 8601 datetime or date for all-day). ${ALL_DAY_END_NOTE}`),
+    end: z.string().optional().describe(`New end time (ISO 8601 datetime or date for all-day). ${ALL_DAY_END_NOTE}`),
     description: z.string().optional(),
     location: z.string().optional(),
     attendees: z.array(z.object({ email: z.string(), displayName: z.string().optional() })).optional(),
-    timeZone: z.string().optional(),
+    timeZone: z.string().optional().describe("IANA timezone to apply to a new start/end. If omitted, the event's existing timezone is preserved."),
     sendUpdates: z.enum(["all", "externalOnly", "none"]).optional(),
     colorId: z.string().optional(),
   }, async (opts) => {
     const cal = api();
-    const existing = await cal.events.get({ calendarId: opts.calendarId, eventId: opts.eventId });
-    const body = existing.data;
+    const requestBody: calendar_v3.Schema$Event = {};
 
-    if (opts.summary !== undefined) body.summary = opts.summary;
-    if (opts.description !== undefined) body.description = opts.description;
-    if (opts.location !== undefined) body.location = opts.location;
-    if (opts.attendees !== undefined) body.attendees = opts.attendees;
-    if (opts.colorId !== undefined) body.colorId = opts.colorId;
-    if (opts.start) {
-      const isAllDay = !opts.start.includes("T");
-      body.start = isAllDay ? { date: opts.start } : { dateTime: opts.start, timeZone: opts.timeZone };
-    }
-    if (opts.end) {
-      const isAllDay = !opts.end.includes("T");
-      body.end = isAllDay ? { date: opts.end } : { dateTime: opts.end, timeZone: opts.timeZone };
+    if (opts.summary !== undefined) requestBody.summary = opts.summary;
+    if (opts.description !== undefined) requestBody.description = opts.description;
+    if (opts.location !== undefined) requestBody.location = opts.location;
+    if (opts.attendees !== undefined) requestBody.attendees = opts.attendees;
+    if (opts.colorId !== undefined) requestBody.colorId = opts.colorId;
+
+    if (opts.start !== undefined || opts.end !== undefined) {
+      // Only fetch the existing event's timezone if we actually need it: a
+      // timed start/end is being changed, no explicit timeZone was given,
+      // and the datetime string itself doesn't already carry a UTC offset.
+      const needsExistingTimeZone = !opts.timeZone && (
+        (opts.start !== undefined && opts.start.includes("T") && !hasExplicitOffset(opts.start)) ||
+        (opts.end !== undefined && opts.end.includes("T") && !hasExplicitOffset(opts.end))
+      );
+      let existingTimeZone: string | undefined;
+      if (needsExistingTimeZone) {
+        const existing = await cal.events.get({
+          calendarId: opts.calendarId, eventId: opts.eventId,
+          fields: "start(timeZone),end(timeZone)",
+        });
+        existingTimeZone = existing.data.start?.timeZone || existing.data.end?.timeZone || undefined;
+      }
+
+      if (opts.start !== undefined) {
+        const isAllDay = !opts.start.includes("T");
+        requestBody.start = isAllDay ? { date: opts.start } : { dateTime: opts.start, timeZone: opts.timeZone || existingTimeZone };
+      }
+      if (opts.end !== undefined) {
+        const isAllDay = !opts.end.includes("T");
+        requestBody.end = isAllDay ? { date: opts.end } : { dateTime: opts.end, timeZone: opts.timeZone || existingTimeZone };
+      }
     }
 
-    const res = await cal.events.update({
+    const res = await cal.events.patch({
       calendarId: opts.calendarId, eventId: opts.eventId,
       sendUpdates: opts.sendUpdates,
-      requestBody: body,
+      requestBody,
     });
     return textResult(formatEvent(res.data ));
   });
