@@ -6,36 +6,19 @@ import { textResult } from "../../utils/formatting.js";
 
 export function registerMeetTools(server: McpServer, ctx: ServiceContext): void {
   const meetApi = google.meet({ version: "v2", auth: ctx.auth });
-  const calApi = google.calendar({ version: "v3", auth: ctx.auth });
 
-  server.tool("meet_create_link", "Create a new Google Meet meeting link", {
-    summary: z.string().optional().describe("Meeting title"),
-  }, async ({ summary }) => {
-    const cal = calApi;
-    const now = new Date();
-    const later = new Date(now.getTime() + 60 * 60 * 1000);
-
-    const res = await cal.events.insert({
-      calendarId: "primary",
-      conferenceDataVersion: 1,
-      requestBody: {
-        summary: summary || "Quick Meeting",
-        start: { dateTime: now.toISOString() },
-        end: { dateTime: later.toISOString() },
-        conferenceData: {
-          createRequest: {
-            requestId: `meet-${Date.now()}`,
-            conferenceSolutionKey: { type: "hangoutsMeet" },
-          },
-        },
-      },
-    });
-
-    const meetLink = res.data.conferenceData?.entryPoints?.find((ep) => ep.entryPointType === "video")?.uri;
+  server.tool("meet_create_link", "Create a standalone Google Meet meeting space and return its join link, without putting anything on your calendar. Use this for an ad-hoc link. To schedule a titled meeting on the calendar with a Meet link, use calendar_create_event (with conferenceData) or calendar_add_meet_link instead.", {
+    summary: z.string().optional().describe("Ignored: a standalone Meet space has no title. To title a meeting, create a calendar event instead."),
+  }, async () => {
+    // Meet REST v2 spaces.create mints a reusable meeting space directly,
+    // instead of the old approach of inserting a real event starting NOW on
+    // the primary calendar (which polluted the calendar). Requires the
+    // meetings.space.created OAuth scope.
+    const res = await meetApi.spaces.create({ requestBody: {} });
     return textResult({
-      meetLink,
-      eventId: res.data.id,
-      htmlLink: res.data.htmlLink,
+      meetLink: res.data.meetingUri,
+      meetingCode: res.data.meetingCode,
+      space: res.data.name,
     });
   });
 
