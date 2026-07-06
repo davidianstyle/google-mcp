@@ -3,6 +3,7 @@ import { google } from "googleapis";
 import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult, mimeShortcut } from "../../utils/formatting.js";
+import { escapeDriveQueryValue } from "../../utils/drive-query.js";
 
 import { drive_v3 } from "googleapis";
 import { mkdir, writeFile, readdir, stat, unlink } from "node:fs/promises";
@@ -152,10 +153,10 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     modifiedAfter: z.string().optional().describe("ISO 8601 date filter"),
   }, async ({ folderId, mimeType, maxResults, orderBy, sortDirection, ownedByMe, modifiedAfter }) => {
     const qParts: string[] = ["trashed = false"];
-    if (folderId) qParts.push(`'${folderId}' in parents`);
-    if (mimeType) qParts.push(`mimeType = '${mimeShortcut(mimeType)}'`);
+    if (folderId) qParts.push(`'${escapeDriveQueryValue(folderId)}' in parents`);
+    if (mimeType) qParts.push(`mimeType = '${escapeDriveQueryValue(mimeShortcut(mimeType))}'`);
     if (ownedByMe) qParts.push("'me' in owners");
-    if (modifiedAfter) qParts.push(`modifiedTime > '${modifiedAfter}'`);
+    if (modifiedAfter) qParts.push(`modifiedTime > '${escapeDriveQueryValue(modifiedAfter)}'`);
 
     const order = `${orderBy} ${sortDirection === "asc" ? "" : "desc"}`.trim();
     const res = await api().files.list({
@@ -183,7 +184,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
       const fRes = await drive.files.list({
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
-        q: `'${folderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+        q: `'${escapeDriveQueryValue(folderId)}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
         pageSize: maxResults,
         orderBy: "name",
         fields: "files(id,name,modifiedTime)",
@@ -195,7 +196,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
       const fRes = await drive.files.list({
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
-        q: `'${folderId}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false`,
+        q: `'${escapeDriveQueryValue(folderId)}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false`,
         pageSize: maxResults,
         orderBy: "name",
         fields: "files(id,name,mimeType,modifiedTime)",
@@ -218,12 +219,13 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     pageToken: z.string().optional(),
   }, async ({ query, searchIn, folderId, mimeType, maxResults, orderBy, sortDirection, modifiedAfter, pageToken }) => {
     const qParts: string[] = ["trashed = false"];
-    if (searchIn === "name") qParts.push(`name contains '${query}'`);
-    else if (searchIn === "content") qParts.push(`fullText contains '${query}'`);
-    else qParts.push(`(name contains '${query}' or fullText contains '${query}')`);
-    if (folderId) qParts.push(`'${folderId}' in parents`);
-    if (mimeType) qParts.push(`mimeType = '${mimeShortcut(mimeType)}'`);
-    if (modifiedAfter) qParts.push(`modifiedTime > '${modifiedAfter}'`);
+    const escapedQuery = escapeDriveQueryValue(query);
+    if (searchIn === "name") qParts.push(`name contains '${escapedQuery}'`);
+    else if (searchIn === "content") qParts.push(`fullText contains '${escapedQuery}'`);
+    else qParts.push(`(name contains '${escapedQuery}' or fullText contains '${escapedQuery}')`);
+    if (folderId) qParts.push(`'${escapeDriveQueryValue(folderId)}' in parents`);
+    if (mimeType) qParts.push(`mimeType = '${escapeDriveQueryValue(mimeShortcut(mimeType))}'`);
+    if (modifiedAfter) qParts.push(`modifiedTime > '${escapeDriveQueryValue(modifiedAfter)}'`);
 
     const res = await api().files.list({
       supportsAllDrives: true,
@@ -446,7 +448,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     const children = await drive.files.list({
       supportsAllDrives: true,
       includeItemsFromAllDrives: true,
-      q: `'${folderId}' in parents and trashed = false`,
+      q: `'${escapeDriveQueryValue(folderId)}' in parents and trashed = false`,
       fields: "files(id)",
       pageSize: 1000,
     });
