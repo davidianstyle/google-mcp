@@ -8,10 +8,23 @@ import { decodeCompositePageToken, encodeCompositePageToken } from "../../utils/
 
 import { drive_v3 } from "googleapis";
 import { writeFile, stat, unlink } from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, createReadStream } from "node:fs";
+import { basename, extname } from "node:path";
 import { pipeline } from "node:stream/promises";
 import type { Readable } from "node:stream";
 import { ensureCacheInitialized, maybePeriodicSweep, cachePath } from "../../utils/download-cache.js";
+
+// Minimal extension -> MIME map for uploads when the caller doesn't specify one.
+const UPLOAD_EXT_TO_MIME: Record<string, string> = {
+  ".txt": "text/plain", ".md": "text/markdown", ".csv": "text/csv", ".html": "text/html",
+  ".json": "application/json", ".xml": "application/xml", ".pdf": "application/pdf",
+  ".zip": "application/zip", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+  ".gif": "image/gif", ".svg": "image/svg+xml", ".mp4": "video/mp4", ".mp3": "audio/mpeg",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+};
 
 // Hard cap for inline (returnContent=true) downloads to keep tool responses
 // from blowing past MCP/LLM context budgets and to avoid OOM. Callers that
@@ -414,5 +427,92 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
       pageSize: 1000,
     });
     return textResult({ ...meta.data, childCount: children.data.files?.length || 0 });
+  });
+
+  server.tool("drive_upload_file", "Upload a local file into Google Drive. Reads from local_path (must exist) and creates a new Drive file. Defaults: name = the file's basename, mime_type = guessed from the extension, destination = My Drive root (pass folder_id to place it in a folder). Large files are uploaded resumably by the SDK.", {
+    local_path: z.string().describe("Path to the local file to upload"),
+    folder_id: z.string().optional().describe("Destination folder ID. Omit for My Drive root."),
+    name: z.string().optional().describe("Name for the Drive file. Defaults to the local file's basename."),
+    mime_type: z.string().optional().describe("MIME type. Guessed from the file extension if omitted."),
+  }, async ({ local_path, folder_id, name, mime_type }) => {
+    // Fail fast with a clean error if the path doesn't exist or isn't a file,
+    // instead of letting a lazy read stream reject opaquely mid-upload.
+    let fileStat;
+    try {
+      fileStat = await stat(local_path);
+    } catch {
+      throw new Error(`Local file not found: ${local_path}`);
+    }
+    if (!fileStat.isFile()) {
+      throw new Error(`Not a regular file: ${local_path}`);
+    }
+
+    const fileName = name || basename(local_path);
+    const mimeType = mime_type || UPLOAD_EXT_TO_MIME[extname(local_path).toLowerCase()] || "application/octet-stream";
+
+    const res = await api.files.create({
+      supportsAllDrives: true,
+      requestBody: {
+        name: fileName,
+        parents: folder_id ? [folder_id] : undefined,
+      },
+      media: {
+        mimeType,
+        body: createReadStream(local_path),
+      },
+      fields: "id,name,mimeType,size,parents,webViewLink",
+    });
+    return textResult({
+      id: res.data.id,
+      name: res.data.name,
+      mimeType: res.data.mimeType,
+      size: res.data.size,
+      url: res.data.webViewLink,
+    });
+  });
+
+  server.tool("drive_share", "Share a Drive file (grant a permission). For a specific person or group use type='user'/'group' with an email; type='domain' with a domain; type='anyone' for a public link. Does NOT email the recipient by default (set sendNotificationEmail=true to notify).", {
+    fileId: z.string(),
+    role: z.enum(["reader", "commenter", "writer", "fileOrganizer", "organizer", "owner"]).describe("Access level to grant"),
+    type: z.enum(["user", "group", "domain", "anyone"]).describe("Grantee type"),
+    email: z.string().optional().describe("Email address for type=user or type=group"),
+    domain: z.string().optional().describe("Domain for type=domain"),
+    sendNotificationEmail: z.boolean().optional().default(false).describe("Whether to email the grantee. Default false."),
+    emailMessage: z.string().optional().describe("Custom message to include when sendNotificationEmail is true"),
+    allowFileDiscovery: z.boolean().optional().describe("For type=domain/anyone: whether the file surfaces in search. Default (unset) is a link-only share."),
+  }, async ({ fileId, role, type, email, domain, sendNotificationEmail, emailMessage, allowFileDiscovery }) => {
+    if ((type === "user" || type === "group") && !email) {
+      throw new Error(`type='${type}' requires an email address.`);
+    }
+    if (type === "domain" && !domain) {
+      throw new Error("type='domain' requires a domain.");
+    }
+    const permission: drive_v3.Schema$Permission = { role, type };
+    if (email) permission.emailAddress = email;
+    if (domain) permission.domain = domain;
+    if (allowFileDiscovery !== undefined) permission.allowFileDiscovery = allowFileDiscovery;
+
+    const res = await api.permissions.create({
+      supportsAllDrives: true,
+      fileId,
+      sendNotificationEmail,
+      emailMessage,
+      requestBody: permission,
+      fields: "id,type,role,emailAddress,domain,allowFileDiscovery",
+    });
+    return textResult(res.data);
+  });
+
+  server.tool("drive_list_permissions", "List who has access to a Drive file (its permissions).", {
+    fileId: z.string(),
+    pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
+  }, async ({ fileId, pageToken }) => {
+    const res = await api.permissions.list({
+      supportsAllDrives: true,
+      fileId,
+      pageToken,
+      fields: "nextPageToken,permissions(id,type,role,emailAddress,domain,displayName,allowFileDiscovery)",
+    });
+    return textResult({ permissions: res.data.permissions || [], nextPageToken: res.data.nextPageToken });
   });
 }
