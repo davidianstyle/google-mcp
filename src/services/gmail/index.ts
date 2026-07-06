@@ -4,6 +4,8 @@ import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
 import { buildRawEmail, encodeBase64Url, extractAttachments, extractBody, formatMessage, getHeader } from "../../utils/email.js";
+import { withConcurrencyLimit } from "../../utils/concurrency.js";
+import { mapGoogleError } from "../../utils/errors.js";
 
 const FILTER_TEMPLATES: Record<string, { criteria: Record<string, unknown>; action: Record<string, unknown> }> = {
   newsletter: { criteria: { query: "unsubscribe" }, action: { removeLabelIds: ["INBOX"] } },
@@ -22,20 +24,30 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     const res = await gmail.users.messages.list({ userId: "me", q: query, maxResults: maxResults || 10 });
     if (!res.data.messages?.length) return textResult("No messages found.");
 
-    const messages = await Promise.all(
-      res.data.messages.map(async (m) => {
-        const full = await gmail.users.messages.get({ userId: "me", id: m.id!, format: "metadata", metadataHeaders: ["From", "To", "Subject", "Date"] });
-        return {
-          id: full.data.id,
-          threadId: full.data.threadId,
-          snippet: full.data.snippet,
-          subject: getHeader(full.data.payload?.headers, "subject"),
-          from: getHeader(full.data.payload?.headers, "from"),
-          date: getHeader(full.data.payload?.headers, "date"),
-        };
-      })
-    );
-    return textResult(messages);
+    const ids = res.data.messages;
+    const settled = await withConcurrencyLimit(ids, 5, async (m) => {
+      const full = await gmail.users.messages.get({ userId: "me", id: m.id!, format: "metadata", metadataHeaders: ["From", "To", "Subject", "Date"] });
+      return {
+        id: full.data.id,
+        threadId: full.data.threadId,
+        snippet: full.data.snippet,
+        subject: getHeader(full.data.payload?.headers, "subject"),
+        from: getHeader(full.data.payload?.headers, "from"),
+        date: getHeader(full.data.payload?.headers, "date"),
+      };
+    });
+
+    const messages: Array<{ id?: string | null; threadId?: string | null; snippet?: string | null; subject?: string; from?: string; date?: string }> = [];
+    const failures: Array<{ id?: string | null; error: string }> = [];
+    settled.forEach((result, i) => {
+      if (result.status === "fulfilled") {
+        messages.push(result.value);
+      } else {
+        failures.push({ id: ids[i].id, error: mapGoogleError(result.reason) });
+      }
+    });
+
+    return textResult(failures.length ? { messages, failures } : messages);
   });
 
   server.tool("gmail_read_email", "Read the full content of an email", {

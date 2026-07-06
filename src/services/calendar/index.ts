@@ -3,6 +3,7 @@ import { google } from "googleapis";
 import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
+import { mapGoogleError } from "../../utils/errors.js";
 
 import { calendar_v3 } from "googleapis";
 
@@ -108,7 +109,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     })),
   }, async ({ calendarId, events }) => {
     const cal = api();
-    const results = await Promise.all(events.map(async (evt) => {
+    const settled = await Promise.allSettled(events.map(async (evt) => {
       const isAllDay = !evt.start.includes("T");
       const res = await cal.events.insert({
         calendarId,
@@ -123,7 +124,18 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
       });
       return { id: res.data.id, summary: res.data.summary, htmlLink: res.data.htmlLink };
     }));
-    return textResult(results);
+
+    const created: Array<{ id?: string | null; summary?: string | null; htmlLink?: string | null }> = [];
+    const failed: Array<{ summary: string; error: string }> = [];
+    settled.forEach((result, i) => {
+      if (result.status === "fulfilled") {
+        created.push(result.value);
+      } else {
+        failed.push({ summary: events[i].summary, error: mapGoogleError(result.reason) });
+      }
+    });
+
+    return textResult(failed.length ? { created, failed } : created);
   });
 
   server.tool("calendar_get_event", "Get details of a specific event", {

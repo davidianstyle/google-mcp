@@ -400,18 +400,14 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     const sheet = info.data.sheets?.find((s) => s.properties?.sheetId === sheetId);
     const rowCount = sheet?.properties?.gridProperties?.rowCount || 1000;
 
-    try {
-      await api().spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: {
-          requests: [{
-            deleteDimensionGroup: { range: { sheetId, dimension: "ROWS", startIndex: 0, endIndex: rowCount } },
-          }],
-        },
-      });
-    } catch {
-      // No groups to delete
-    }
+    await api().spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{
+          deleteDimensionGroup: { range: { sheetId, dimension: "ROWS", startIndex: 0, endIndex: rowCount } },
+        }],
+      },
+    });
     return textResult({ success: true });
   });
 
