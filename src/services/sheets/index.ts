@@ -5,10 +5,48 @@ import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
 import { parseA1Range } from "../../utils/a1.js";
 import { assertCellCountWithinCap, countCells } from "../../utils/sheets-guard.js";
+import {
+  buildFindReplaceRequest,
+  buildInsertDimensionRequest,
+  buildMergeCellsRequest,
+  buildUpdateBordersRequest,
+  buildAddNamedRangeRequest,
+  gridRangeFromA1,
+  type BorderSide,
+} from "./builders.js";
 
 export function registerSheetsTools(server: McpServer, ctx: ServiceContext): void {
   const api = google.sheets({ version: "v4", auth: ctx.auth });
   const driveApi = google.drive({ version: "v3", auth: ctx.auth });
+
+  /** Resolves a sheet name to its numeric sheetId within a spreadsheet. */
+  async function resolveSheetId(spreadsheetId: string, sheetName: string): Promise<number> {
+    const info = await api.spreadsheets.get({ spreadsheetId, fields: "sheets.properties(sheetId,title)" });
+    const match = info.data.sheets?.find((s) => s.properties?.title === sheetName);
+    if (!match || match.properties?.sheetId == null) {
+      throw new Error(`Sheet "${sheetName}" not found in spreadsheet ${spreadsheetId}`);
+    }
+    return match.properties.sheetId;
+  }
+
+  /**
+   * Turns an A1 range into a GridRange. The target sheet comes from the range's
+   * own "Sheet1!" prefix if present, otherwise from fallbackSheetId. Throws if
+   * neither identifies a sheet.
+   */
+  async function resolveGridRange(
+    spreadsheetId: string,
+    a1: string,
+    fallbackSheetId?: number
+  ): Promise<sheets_v4.Schema$GridRange> {
+    const parsed = parseA1Range(a1);
+    let sheetId = fallbackSheetId;
+    if (parsed.sheetName) sheetId = await resolveSheetId(spreadsheetId, parsed.sheetName);
+    if (sheetId === undefined) {
+      throw new Error(`Provide a sheet-qualified range (e.g. 'Sheet1!A1:C3') or a sheetId for "${a1}".`);
+    }
+    return gridRangeFromA1(parsed, sheetId);
+  }
 
   server.tool("sheets_read", "Read data from a spreadsheet range", {
     spreadsheetId: z.string(),
@@ -526,5 +564,140 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
       requestBody: { values: rows },
     });
     return textResult({ updatedRange: res.data.updatedRange, updatedCells: res.data.updatedCells });
+  });
+
+  server.tool("sheets_batch_read", "Read several ranges from a spreadsheet in one call (values.batchGet). Use this instead of multiple sheets_read calls when you need a few different ranges at once.", {
+    spreadsheetId: z.string(),
+    ranges: z.array(z.string()).describe("A1 ranges to read (e.g. ['Sheet1!A1:C10', 'Totals!A1:B2'])"),
+    valueRenderOption: z.enum(["FORMATTED_VALUE", "UNFORMATTED_VALUE", "FORMULA"]).optional().default("FORMATTED_VALUE"),
+  }, async ({ spreadsheetId, ranges, valueRenderOption }) => {
+    const res = await api.spreadsheets.values.batchGet({ spreadsheetId, ranges, valueRenderOption });
+    const valueRanges = res.data.valueRanges || [];
+    const totalCells = valueRanges.reduce((sum, vr) => sum + countCells(vr.values), 0);
+    assertCellCountWithinCap(totalCells, ranges.join(", "));
+    return textResult({ valueRanges: valueRanges.map((vr) => ({ range: vr.range, values: vr.values })) });
+  });
+
+  server.tool("sheets_find_replace", "Find and replace text. Scope: whole spreadsheet by default, one sheet via sheetId, or a specific area via range (A1). Supports case-sensitive, whole-cell, and regex matching.", {
+    spreadsheetId: z.string(),
+    find: z.string(),
+    replacement: z.string(),
+    range: z.string().optional().describe("Limit to an A1 range (e.g. 'Sheet1!A1:C10'). Overrides sheetId."),
+    sheetId: z.number().optional().describe("Limit to a single sheet by id. Omit both range and sheetId to search all sheets."),
+    matchCase: z.boolean().optional(),
+    matchEntireCell: z.boolean().optional(),
+    searchByRegex: z.boolean().optional(),
+  }, async (opts) => {
+    const gridRange = opts.range ? await resolveGridRange(opts.spreadsheetId, opts.range, opts.sheetId) : undefined;
+    const request = buildFindReplaceRequest({
+      find: opts.find,
+      replacement: opts.replacement,
+      matchCase: opts.matchCase,
+      matchEntireCell: opts.matchEntireCell,
+      searchByRegex: opts.searchByRegex,
+      sheetId: opts.sheetId,
+      range: gridRange,
+    });
+    const res = await api.spreadsheets.batchUpdate({ spreadsheetId: opts.spreadsheetId, requestBody: { requests: [request] } });
+    const fr = res.data.replies?.[0]?.findReplace;
+    return textResult({
+      occurrencesChanged: fr?.occurrencesChanged || 0,
+      valuesChanged: fr?.valuesChanged || 0,
+      rowsChanged: fr?.rowsChanged || 0,
+      sheetsChanged: fr?.sheetsChanged || 0,
+    });
+  });
+
+  server.tool("sheets_insert_rows", "Insert blank rows into a sheet, shifting existing rows down. Indices are zero-based and half-open: startIndex=2,endIndex=4 inserts 2 rows before row 3.", {
+    spreadsheetId: z.string(),
+    sheetId: z.number(),
+    startIndex: z.number().describe("Zero-based row index to insert before"),
+    endIndex: z.number().describe("Exclusive end index; (endIndex - startIndex) rows are inserted"),
+    inheritFromBefore: z.boolean().optional().default(false).describe("Inherit formatting from the row above (true) or below (false)"),
+  }, async ({ spreadsheetId, sheetId, startIndex, endIndex, inheritFromBefore }) => {
+    await api.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: [buildInsertDimensionRequest({ sheetId, dimension: "ROWS", startIndex, endIndex, inheritFromBefore })] },
+    });
+    return textResult({ success: true, inserted: endIndex - startIndex, dimension: "ROWS" });
+  });
+
+  server.tool("sheets_insert_columns", "Insert blank columns into a sheet, shifting existing columns right. Indices are zero-based and half-open (column A = 0).", {
+    spreadsheetId: z.string(),
+    sheetId: z.number(),
+    startIndex: z.number().describe("Zero-based column index to insert before (A=0, B=1, ...)"),
+    endIndex: z.number().describe("Exclusive end index; (endIndex - startIndex) columns are inserted"),
+    inheritFromBefore: z.boolean().optional().default(false).describe("Inherit formatting from the column to the left (true) or right (false)"),
+  }, async ({ spreadsheetId, sheetId, startIndex, endIndex, inheritFromBefore }) => {
+    await api.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: [buildInsertDimensionRequest({ sheetId, dimension: "COLUMNS", startIndex, endIndex, inheritFromBefore })] },
+    });
+    return textResult({ success: true, inserted: endIndex - startIndex, dimension: "COLUMNS" });
+  });
+
+  server.tool("sheets_merge_cells", "Merge a range of cells. Pass a sheet-qualified A1 range (e.g. 'Sheet1!A1:C1') or an A1 range plus sheetId. mergeType MERGE_ALL merges to one cell; MERGE_COLUMNS/MERGE_ROWS merge along one axis.", {
+    spreadsheetId: z.string(),
+    range: z.string().describe("A1 range to merge (e.g. 'Sheet1!A1:C1')"),
+    sheetId: z.number().optional().describe("Sheet id, if the range isn't sheet-qualified"),
+    mergeType: z.enum(["MERGE_ALL", "MERGE_COLUMNS", "MERGE_ROWS"]).optional().default("MERGE_ALL"),
+  }, async ({ spreadsheetId, range, sheetId, mergeType }) => {
+    const gridRange = await resolveGridRange(spreadsheetId, range, sheetId);
+    await api.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: [buildMergeCellsRequest({ range: gridRange, mergeType })] },
+    });
+    return textResult({ success: true });
+  });
+
+  server.tool("sheets_set_borders", "Set borders on a cell range. Choose which sides to draw and the line style/color. Pass a sheet-qualified A1 range or an A1 range plus sheetId.", {
+    spreadsheetId: z.string(),
+    range: z.string().describe("A1 range (e.g. 'Sheet1!A1:C10')"),
+    sheetId: z.number().optional().describe("Sheet id, if the range isn't sheet-qualified"),
+    sides: z.array(z.enum(["top", "bottom", "left", "right", "innerHorizontal", "innerVertical"])).optional().default(["top", "bottom", "left", "right"]).describe("Which borders to draw"),
+    style: z.enum(["SOLID", "SOLID_MEDIUM", "SOLID_THICK", "DASHED", "DOTTED", "DOUBLE", "NONE"]).optional().default("SOLID"),
+    color: z.object({ red: z.number().optional(), green: z.number().optional(), blue: z.number().optional() }).optional().describe("RGB 0-1 components; defaults to black"),
+  }, async ({ spreadsheetId, range, sheetId, sides, style, color }) => {
+    const gridRange = await resolveGridRange(spreadsheetId, range, sheetId);
+    await api.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: [buildUpdateBordersRequest({ range: gridRange, style, color, sides: sides as BorderSide[] })] },
+    });
+    return textResult({ success: true });
+  });
+
+  server.tool("sheets_copy_sheet_to", "Copy a sheet (tab) into another spreadsheet (spreadsheets.sheets.copyTo). The copy lands in the destination with a name like 'Copy of <title>'.", {
+    spreadsheetId: z.string().describe("Source spreadsheet id"),
+    sheetId: z.number().describe("Id of the sheet to copy"),
+    destinationSpreadsheetId: z.string().describe("Spreadsheet id to copy the sheet into"),
+  }, async ({ spreadsheetId, sheetId, destinationSpreadsheetId }) => {
+    const res = await api.spreadsheets.sheets.copyTo({
+      spreadsheetId,
+      sheetId,
+      requestBody: { destinationSpreadsheetId },
+    });
+    return textResult({ sheetId: res.data.sheetId, title: res.data.title, index: res.data.index });
+  });
+
+  server.tool("sheets_add_named_range", "Create a named range (a reusable name for a cell range, usable in formulas). Pass a sheet-qualified A1 range or an A1 range plus sheetId.", {
+    spreadsheetId: z.string(),
+    name: z.string().describe("Name for the range (letters, digits, underscores; no spaces)"),
+    range: z.string().describe("A1 range the name refers to (e.g. 'Sheet1!A1:A100')"),
+    sheetId: z.number().optional().describe("Sheet id, if the range isn't sheet-qualified"),
+  }, async ({ spreadsheetId, name, range, sheetId }) => {
+    const gridRange = await resolveGridRange(spreadsheetId, range, sheetId);
+    const res = await api.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: [buildAddNamedRangeRequest({ name, range: gridRange })] },
+    });
+    const nr = res.data.replies?.[0]?.addNamedRange?.namedRange;
+    return textResult({ namedRangeId: nr?.namedRangeId, name: nr?.name, range: nr?.range });
+  });
+
+  server.tool("sheets_list_named_ranges", "List the named ranges defined in a spreadsheet (id, name, and grid range).", {
+    spreadsheetId: z.string(),
+  }, async ({ spreadsheetId }) => {
+    const res = await api.spreadsheets.get({ spreadsheetId, fields: "namedRanges" });
+    return textResult({ namedRanges: res.data.namedRanges || [] });
   });
 }
