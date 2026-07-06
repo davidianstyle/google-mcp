@@ -79,6 +79,14 @@ describe("buildRawEmail header hardening", () => {
     expect(decodedBody).toBe(longLine);
   });
 
+  it("declares MIME-Version: 1.0 on the plain-text path (required when using Content-Transfer-Encoding)", () => {
+    const raw = buildRawEmail({ to: ["a@b.com"], subject: "test", body: "hello" });
+    const headerEnd = raw.indexOf("\r\n\r\n");
+    const headerLines = raw.slice(0, headerEnd).split("\r\n");
+    expect(headerLines).toContain("MIME-Version: 1.0");
+    expect(headerLines).toContain("Content-Transfer-Encoding: base64");
+  });
+
   it("base64-encodes both parts of a multipart/alternative message", () => {
     const raw = buildRawEmail({
       to: ["a@b.com"],

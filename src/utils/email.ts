@@ -141,6 +141,7 @@ export function buildRawEmail(opts: {
     return headers.join("\r\n") + "\r\n\r\n" + encodeBodyBase64(opts.htmlBody || opts.body);
   }
 
+  headers.push(`MIME-Version: 1.0`);
   headers.push(`Content-Type: text/plain; charset="UTF-8"`);
   headers.push(`Content-Transfer-Encoding: base64`);
   return headers.join("\r\n") + "\r\n\r\n" + encodeBodyBase64(opts.body);

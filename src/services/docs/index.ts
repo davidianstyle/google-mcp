@@ -25,6 +25,21 @@ function extractPlainText(body: docs_v1.Schema$Body | undefined): string {
   return text;
 }
 
+/**
+ * Locates the table created by an insertTable request at `location: {index}`.
+ * Per the Docs API (Schema$InsertTableRequest.location): "A newline character
+ * will be inserted before the inserted table, therefore the table start
+ * index will be at the specified location index + 1." Returns undefined when
+ * no table sits at that position — callers must treat that as an error, not
+ * fall back to some other table.
+ */
+export function findInsertedTable(
+  content: docs_v1.Schema$StructuralElement[] | undefined,
+  insertionIndex: number
+): docs_v1.Schema$Table | undefined {
+  return content?.find((e) => e.table && e.startIndex === insertionIndex + 1)?.table ?? undefined;
+}
+
 function findTab(tabs: docs_v1.Schema$Tab[] | undefined, tabId: string): docs_v1.Schema$Tab | undefined {
   for (const tab of tabs || []) {
     if (tab.tabProperties?.tabId === tabId) return tab;
@@ -277,9 +292,10 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     });
 
     const doc = await docs.documents.get({ documentId });
-    const tables = doc.data.body?.content?.filter((e) => e.table) || [];
-    const table = tables.find((t) => t.startIndex === index)?.table;
-    if (!table?.tableRows) return textResult({ success: true, note: "Table inserted but could not populate" });
+    const table = findInsertedTable(doc.data.body?.content, index);
+    if (!table?.tableRows) {
+      throw new Error(`Table was inserted at index ${index} but could not be located to populate (expected a table with startIndex ${index + 1}). The table exists but is empty.`);
+    }
 
     const requests: docs_v1.Schema$Request[] = [];
     for (let r = table.tableRows.length - 1; r >= 0; r--) {
