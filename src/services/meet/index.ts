@@ -7,7 +7,7 @@ import { textResult } from "../../utils/formatting.js";
 export function registerMeetTools(server: McpServer, ctx: ServiceContext): void {
   const meetApi = google.meet({ version: "v2", auth: ctx.auth });
 
-  server.tool("meet_create_link", "Create a standalone Google Meet meeting space and return its join link, without putting anything on your calendar. Use this for an ad-hoc link. To schedule a titled meeting on the calendar with a Meet link, use calendar_create_event (with conferenceData) or calendar_add_meet_link instead.", {
+  server.tool("meet_create_link", "Create a standalone Google Meet meeting space and return its join link, without putting anything on your calendar. Use this for an ad-hoc link. To schedule a titled meeting on the calendar with a Meet link, use calendar_create_event (with conferenceData) or calendar_add_meet_link instead. REQUIRES the meetings.space.created OAuth scope: accounts authorized before this scope was added get a 403 'insufficient authentication scopes' error until add-google-account.sh is re-run for the account; if that happens, tell the user to re-run it (do not retry) or fall back to calendar_create_event with conferenceData.", {
     summary: z.string().optional().describe("Ignored: a standalone Meet space has no title. To title a meeting, create a calendar event instead."),
   }, async () => {
     // Meet REST v2 spaces.create mints a reusable meeting space directly,
