@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildRawEmail, htmlToText } from "./email.js";
+import {
+  buildRawEmail,
+  buildReplyHeaders,
+  htmlToText,
+  parseAddressList,
+  type OriginalMessageHeaders,
+} from "./email.js";
 
 describe("buildRawEmail header hardening", () => {
   it("neutralizes a CRLF header-injection attempt in the subject", () => {
@@ -97,6 +103,102 @@ describe("buildRawEmail header hardening", () => {
     });
     const encodedCount = (raw.match(/Content-Transfer-Encoding: base64/g) || []).length;
     expect(encodedCount).toBe(2);
+  });
+});
+
+describe("buildRawEmail attachments (multipart/mixed)", () => {
+  const contentBase64 = Buffer.from("file bytes").toString("base64");
+
+  it("wraps the body and each attachment in a multipart/mixed container", () => {
+    const raw = buildRawEmail({
+      to: ["a@b.com"],
+      subject: "with file",
+      body: "see attached",
+      attachments: [{ filename: "notes.txt", mimeType: "text/plain", contentBase64 }],
+    });
+    const headerEnd = raw.indexOf("\r\n\r\n");
+    const topHeaders = raw.slice(0, headerEnd);
+    const mixed = /Content-Type: multipart\/mixed; boundary="(mixed_[^"]+)"/.exec(topHeaders);
+    expect(mixed).not.toBeNull();
+    const boundary = mixed![1];
+    // Opening delimiter for both parts, plus the closing delimiter.
+    expect((raw.match(new RegExp(`--${boundary}(?!--)`, "g")) || []).length).toBe(2);
+    expect(raw).toContain(`--${boundary}--`);
+    expect(raw).toContain('Content-Disposition: attachment; filename="notes.txt"');
+    // The attachment's bytes are present, base64-encoded.
+    expect(raw).toContain(contentBase64);
+  });
+
+  it("nests a multipart/alternative body inside the mixed container", () => {
+    const raw = buildRawEmail({
+      to: ["a@b.com"],
+      subject: "rich + file",
+      body: "plain",
+      htmlBody: "<p>rich</p>",
+      mimeType: "multipart/alternative",
+      attachments: [{ filename: "a.bin", mimeType: "application/octet-stream", contentBase64 }],
+    });
+    expect(raw).toContain("Content-Type: multipart/mixed;");
+    expect(raw).toContain("Content-Type: multipart/alternative;");
+  });
+
+  it("strips CR/LF and quotes from an attachment filename to prevent header injection", () => {
+    const raw = buildRawEmail({
+      to: ["a@b.com"],
+      subject: "evil",
+      body: "x",
+      attachments: [{ filename: 'a"\r\nX-Evil: yes.txt', mimeType: "text/plain", contentBase64 }],
+    });
+    expect(raw.split("\r\n").some((l) => /^X-Evil:/i.test(l))).toBe(false);
+  });
+});
+
+describe("parseAddressList", () => {
+  it("extracts bare addresses, honoring commas inside display names", () => {
+    expect(parseAddressList('"Doe, Jane" <jane@x.com>, bob@y.com')).toEqual([
+      "jane@x.com",
+      "bob@y.com",
+    ]);
+  });
+
+  it("returns an empty list for an empty header", () => {
+    expect(parseAddressList("")).toEqual([]);
+  });
+});
+
+describe("buildReplyHeaders", () => {
+  const original: OriginalMessageHeaders = {
+    messageIdHeader: "<msg-2@mail.example.com>",
+    references: "<msg-1@mail.example.com>",
+    subject: "Project update",
+    from: "Alice <alice@example.com>",
+    to: "me@example.com, Carol <carol@example.com>",
+    cc: "dave@example.com",
+  };
+
+  it("replies to the sender, threads via In-Reply-To and an extended References chain", () => {
+    const r = buildReplyHeaders(original, { selfEmail: "me@example.com" });
+    expect(r.to).toEqual(["alice@example.com"]);
+    expect(r.cc).toEqual([]);
+    expect(r.inReplyTo).toBe("<msg-2@mail.example.com>");
+    expect(r.references).toBe("<msg-1@mail.example.com> <msg-2@mail.example.com>");
+    expect(r.subject).toBe("Re: Project update");
+  });
+
+  it("reply-all CCs the other recipients but drops self and the sender", () => {
+    const r = buildReplyHeaders(original, { replyAll: true, selfEmail: "me@example.com" });
+    expect(r.to).toEqual(["alice@example.com"]);
+    expect(r.cc).toEqual(["carol@example.com", "dave@example.com"]);
+  });
+
+  it("does not double-prefix a subject that already starts with Re:", () => {
+    const r = buildReplyHeaders({ ...original, subject: "RE: Project update" });
+    expect(r.subject).toBe("RE: Project update");
+  });
+
+  it("uses the Message-ID alone as References when the original had none", () => {
+    const r = buildReplyHeaders({ ...original, references: "" });
+    expect(r.references).toBe("<msg-2@mail.example.com>");
   });
 });
 

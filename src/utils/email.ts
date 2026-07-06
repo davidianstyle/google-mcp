@@ -97,6 +97,54 @@ function encodeBodyBase64(text: string): string {
   return wrapBase64(Buffer.from(text, "utf-8").toString("base64"));
 }
 
+/** An email attachment, already base64-encoded (standard base64, not URL-safe). */
+export interface EmailAttachment {
+  filename: string;
+  mimeType: string;
+  /** Standard base64 of the raw bytes. Whitespace is stripped before (re)wrapping to 76-char lines. */
+  contentBase64: string;
+}
+
+/**
+ * Renders just the MIME "body part" — a Content-Type/Content-Transfer-Encoding
+ * header block plus the encoded body — without any message-level (To/From/…)
+ * headers. Returned as a self-contained part so it can be used either at the
+ * top level of a message or nested inside a multipart/mixed container (when
+ * attachments are present).
+ */
+function renderBodyPart(opts: { body: string; htmlBody?: string; mimeType?: string }): string {
+  if (opts.htmlBody && opts.mimeType === "multipart/alternative") {
+    const boundary = `alt_${Date.now()}`;
+    const parts = [
+      `--${boundary}\r\nContent-Type: text/plain; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBodyBase64(opts.body)}`,
+      `--${boundary}\r\nContent-Type: text/html; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBodyBase64(opts.htmlBody)}`,
+      `--${boundary}--`,
+    ];
+    return `Content-Type: multipart/alternative; boundary="${boundary}"\r\n\r\n` + parts.join("\r\n");
+  }
+
+  if (opts.htmlBody || opts.mimeType === "text/html") {
+    return `Content-Type: text/html; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBodyBase64(opts.htmlBody || opts.body)}`;
+  }
+
+  return `Content-Type: text/plain; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBodyBase64(opts.body)}`;
+}
+
+/** Renders one attachment as a base64 MIME part with a Content-Disposition: attachment header. */
+function renderAttachmentPart(att: EmailAttachment): string {
+  // The filename lands in two structured header params; strip CR/LF (and any
+  // stray quotes) so it can't break out of the quoted-string or inject headers.
+  const filename = sanitizeHeaderValue(att.filename).replace(/"/g, "");
+  const mimeType = sanitizeHeaderValue(att.mimeType) || "application/octet-stream";
+  const body = wrapBase64(att.contentBase64.replace(/\s+/g, ""));
+  return (
+    `Content-Type: ${mimeType}; name="${filename}"\r\n` +
+    `Content-Transfer-Encoding: base64\r\n` +
+    `Content-Disposition: attachment; filename="${filename}"\r\n\r\n` +
+    body
+  );
+}
+
 export function buildRawEmail(opts: {
   to: string[];
   subject: string;
@@ -108,8 +156,8 @@ export function buildRawEmail(opts: {
   inReplyTo?: string;
   references?: string;
   mimeType?: string;
+  attachments?: EmailAttachment[];
 }): string {
-  const boundary = `boundary_${Date.now()}`;
   const headers: string[] = [];
 
   headers.push(addressHeader("To", opts.to.join(", ")));
@@ -122,29 +170,113 @@ export function buildRawEmail(opts: {
     headers.push(addressHeader("In-Reply-To", opts.inReplyTo));
     headers.push(addressHeader("References", opts.references || opts.inReplyTo));
   }
-
-  if (opts.htmlBody && opts.mimeType === "multipart/alternative") {
-    headers.push(`MIME-Version: 1.0`);
-    headers.push(`Content-Type: multipart/alternative; boundary="${boundary}"`);
-    const parts = [
-      `--${boundary}\r\nContent-Type: text/plain; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBodyBase64(opts.body)}`,
-      `--${boundary}\r\nContent-Type: text/html; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBodyBase64(opts.htmlBody)}`,
-      `--${boundary}--`,
-    ];
-    return headers.join("\r\n") + "\r\n\r\n" + parts.join("\r\n");
-  }
-
-  if (opts.htmlBody || opts.mimeType === "text/html") {
-    headers.push(`MIME-Version: 1.0`);
-    headers.push(`Content-Type: text/html; charset="UTF-8"`);
-    headers.push(`Content-Transfer-Encoding: base64`);
-    return headers.join("\r\n") + "\r\n\r\n" + encodeBodyBase64(opts.htmlBody || opts.body);
-  }
-
   headers.push(`MIME-Version: 1.0`);
-  headers.push(`Content-Type: text/plain; charset="UTF-8"`);
-  headers.push(`Content-Transfer-Encoding: base64`);
-  return headers.join("\r\n") + "\r\n\r\n" + encodeBodyBase64(opts.body);
+
+  const bodyPart = renderBodyPart(opts);
+
+  // With attachments, wrap the body part + each attachment in multipart/mixed.
+  // The "mixed_"/"alt_" boundary prefixes contain "_" (not in the base64
+  // alphabet), so a boundary delimiter can never collide with encoded content.
+  if (opts.attachments?.length) {
+    const boundary = `mixed_${Date.now()}`;
+    headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
+    const parts = [bodyPart, ...opts.attachments.map(renderAttachmentPart)];
+    const body = parts.map((p) => `--${boundary}\r\n${p}`).join("\r\n") + `\r\n--${boundary}--`;
+    return headers.join("\r\n") + "\r\n\r\n" + body;
+  }
+
+  // No attachments: the body part's Content-* headers sit at the message top level.
+  return headers.join("\r\n") + "\r\n" + bodyPart;
+}
+
+/** RFC 822 headers of the message being replied to (values as returned by Gmail's metadata format). */
+export interface OriginalMessageHeaders {
+  /** The original message's RFC 822 Message-ID header value, e.g. "<abc@mail.gmail.com>". */
+  messageIdHeader: string;
+  /** The original References header value (may be empty). */
+  references: string;
+  subject: string;
+  from: string;
+  to: string;
+  cc: string;
+}
+
+export interface ReplyHeaders {
+  to: string[];
+  cc: string[];
+  subject: string;
+  inReplyTo: string;
+  references: string;
+}
+
+/** Extracts the addr-spec from one address token ("Name <a@b.com>" -> "a@b.com"). */
+export function extractEmailAddress(token: string): string {
+  const angle = token.match(/<([^>]+)>/);
+  return (angle ? angle[1] : token).trim();
+}
+
+/**
+ * Splits an address-list header value into bare email addresses, respecting
+ * commas that appear inside quoted display names or angle brackets.
+ */
+export function parseAddressList(headerValue: string): string[] {
+  if (!headerValue) return [];
+  const tokens: string[] = [];
+  let current = "";
+  let inQuote = false;
+  let inAngle = false;
+  for (const ch of headerValue) {
+    if (ch === '"') inQuote = !inQuote;
+    else if (ch === "<") inAngle = true;
+    else if (ch === ">") inAngle = false;
+    if (ch === "," && !inQuote && !inAngle) {
+      tokens.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  tokens.push(current);
+  return tokens.map(extractEmailAddress).filter((a) => a.length > 0);
+}
+
+/**
+ * Builds RFC 5322-compliant reply headers from the original message's headers:
+ * threads the reply via In-Reply-To + a References chain, prefixes the subject
+ * with "Re:" (unless it already has one), and computes recipients. A plain
+ * reply goes only to the original sender; reply-all additionally CCs the
+ * original To + Cc recipients, minus the sender (already in To) and minus the
+ * authenticated user (selfEmail).
+ */
+export function buildReplyHeaders(
+  original: OriginalMessageHeaders,
+  opts: { replyAll?: boolean; selfEmail?: string } = {}
+): ReplyHeaders {
+  const to = parseAddressList(original.from);
+  const senderLower = new Set(to.map((a) => a.toLowerCase()));
+  const selfLower = opts.selfEmail?.toLowerCase();
+
+  const cc: string[] = [];
+  if (opts.replyAll) {
+    const seen = new Set<string>();
+    for (const addr of [...parseAddressList(original.to), ...parseAddressList(original.cc)]) {
+      const lower = addr.toLowerCase();
+      if (lower === selfLower) continue; // don't reply to yourself
+      if (senderLower.has(lower)) continue; // already in To
+      if (seen.has(lower)) continue;
+      seen.add(lower);
+      cc.push(addr);
+    }
+  }
+
+  const trimmedSubject = original.subject.trim();
+  const subject = /^re:/i.test(trimmedSubject) ? trimmedSubject : `Re: ${trimmedSubject}`;
+
+  const references = original.references
+    ? `${original.references.trim()} ${original.messageIdHeader}`.trim()
+    : original.messageIdHeader;
+
+  return { to, cc, subject, inReplyTo: original.messageIdHeader, references };
 }
 
 export interface AttachmentInfo {

@@ -1,10 +1,23 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { google } from "googleapis";
+import { google, gmail_v1 } from "googleapis";
 import { z } from "zod";
-import { writeFile } from "node:fs/promises";
+import { writeFile, readFile } from "node:fs/promises";
+import { basename, extname } from "node:path";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
-import { buildRawEmail, decodeBase64UrlToBuffer, encodeBase64Url, extractAttachments, extractBody, formatMessage, getHeader } from "../../utils/email.js";
+import {
+  buildRawEmail,
+  buildReplyHeaders,
+  decodeBase64UrlToBuffer,
+  encodeBase64Url,
+  extractAttachments,
+  extractBody,
+  formatMessage,
+  getHeader,
+  htmlToText,
+  type EmailAttachment,
+  type OriginalMessageHeaders,
+} from "../../utils/email.js";
 import { withConcurrencyLimit } from "../../utils/concurrency.js";
 import { mapGoogleError } from "../../utils/errors.js";
 import { ensureCacheInitialized, maybePeriodicSweep, cachePath } from "../../utils/download-cache.js";
@@ -20,8 +33,68 @@ const FILTER_TEMPLATES: Record<string, { criteria: Record<string, unknown>; acti
 // past MCP/LLM context budgets. Larger attachments are written to disk.
 const MAX_INLINE_ATTACHMENT_BYTES = 2 * 1024 * 1024;
 
+// Minimal extension -> MIME map used to guess an attachment's content type when
+// the caller doesn't supply one. Falls back to application/octet-stream.
+const EXT_TO_MIME: Record<string, string> = {
+  ".txt": "text/plain", ".md": "text/markdown", ".csv": "text/csv", ".html": "text/html",
+  ".json": "application/json", ".pdf": "application/pdf", ".zip": "application/zip",
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+};
+
+const attachmentSchema = z.object({
+  path: z.string().optional().describe("Local filesystem path to read the attachment from"),
+  content_base64: z.string().optional().describe("Base64 of the file bytes, as an alternative to path"),
+  filename: z.string().optional().describe("Attachment filename; defaults to the basename of path"),
+  mime_type: z.string().optional().describe("MIME type; guessed from the file extension if omitted"),
+});
+type AttachmentInput = z.infer<typeof attachmentSchema>;
+
+/** Resolves attachment inputs (path or base64) into ready-to-encode EmailAttachments. */
+async function resolveAttachments(attachments: AttachmentInput[] | undefined): Promise<EmailAttachment[]> {
+  if (!attachments?.length) return [];
+  return Promise.all(
+    attachments.map(async (att) => {
+      let contentBase64: string;
+      let filename = att.filename;
+      if (att.path) {
+        const buf = await readFile(att.path); // throws a clean ENOENT if missing
+        contentBase64 = buf.toString("base64");
+        filename ||= basename(att.path);
+      } else if (att.content_base64) {
+        contentBase64 = att.content_base64;
+      } else {
+        throw new Error("Each attachment must supply either a path or content_base64.");
+      }
+      if (!filename) throw new Error("Attachment from content_base64 requires a filename.");
+      const mimeType = att.mime_type || EXT_TO_MIME[extname(filename).toLowerCase()] || "application/octet-stream";
+      return { filename, mimeType, contentBase64 };
+    })
+  );
+}
+
 export function registerGmailTools(server: McpServer, ctx: ServiceContext): void {
   const api = google.gmail({ version: "v1", auth: ctx.auth });
+
+  // Cache the authenticated user's email address (users.getProfile) for the
+  // process lifetime. Only used as a reply-all self-exclusion fallback, and it
+  // can't change mid-process, so one lookup covers every reply.
+  let cachedProfileEmail: string | undefined;
+  let profileFetched = false;
+  async function getSelfEmail(): Promise<string | undefined> {
+    if (profileFetched) return cachedProfileEmail;
+    try {
+      const res = await api.users.getProfile({ userId: "me" });
+      cachedProfileEmail = res.data.emailAddress || undefined;
+    } catch {
+      cachedProfileEmail = undefined;
+    }
+    profileFetched = true;
+    return cachedProfileEmail;
+  }
 
   server.tool("gmail_search_emails", "Search emails using Gmail search syntax", {
     query: z.string().describe("Gmail search query (e.g., 'from:example@gmail.com')"),
@@ -69,7 +142,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     return textResult(formatMessage(res.data));
   });
 
-  server.tool("gmail_send_email", "Send an email", {
+  server.tool("gmail_send_email", "Send a brand-new email. To reply within an existing thread (correct threading headers, Re: subject), use gmail_reply_to_email instead.", {
     to: z.array(z.string()).describe("Recipient email addresses"),
     subject: z.string().describe("Email subject"),
     body: z.string().describe("Email body (plain text)"),
@@ -78,9 +151,11 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     bcc: z.array(z.string()).optional().describe("BCC recipients"),
     mimeType: z.enum(["text/plain", "text/html", "multipart/alternative"]).optional().default("text/plain"),
     threadId: z.string().optional().describe("Thread ID to reply to"),
-    inReplyTo: z.string().optional().describe("Message ID being replied to"),
+    inReplyTo: z.string().optional().describe("RFC822 Message-ID header value to reference (not a Gmail message id). Prefer gmail_reply_to_email, which fills this in for you."),
+    attachments: z.array(attachmentSchema).optional().describe("Files to attach, each { path | content_base64, filename?, mime_type? }"),
   }, async (opts) => {
-    const raw = encodeBase64Url(buildRawEmail(opts));
+    const attachments = await resolveAttachments(opts.attachments);
+    const raw = encodeBase64Url(buildRawEmail({ ...opts, attachments }));
     const res = await api.users.messages.send({
       userId: "me",
       requestBody: { raw, threadId: opts.threadId },
@@ -97,14 +172,65 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     bcc: z.array(z.string()).optional().describe("BCC recipients"),
     mimeType: z.enum(["text/plain", "text/html", "multipart/alternative"]).optional().default("text/plain"),
     threadId: z.string().optional().describe("Thread ID to reply to"),
-    inReplyTo: z.string().optional().describe("Message ID being replied to"),
+    inReplyTo: z.string().optional().describe("RFC822 Message-ID header value being replied to (not a Gmail message id)"),
+    attachments: z.array(attachmentSchema).optional().describe("Files to attach, each { path | content_base64, filename?, mime_type? }"),
   }, async (opts) => {
-    const raw = encodeBase64Url(buildRawEmail(opts));
+    const attachments = await resolveAttachments(opts.attachments);
+    const raw = encodeBase64Url(buildRawEmail({ ...opts, attachments }));
     const res = await api.users.drafts.create({
       userId: "me",
       requestBody: { message: { raw, threadId: opts.threadId } },
     });
     return textResult({ draftId: res.data.id, messageId: res.data.message?.id, threadId: res.data.message?.threadId });
+  });
+
+  server.tool("gmail_reply_to_email", "Reply to an existing email, correctly threaded. Pass the Gmail API message id of the message you're replying to; this fetches its RFC822 Message-ID/References/Subject and builds a proper In-Reply-To + References chain, a 'Re:' subject, and reuses the thread. Use this instead of gmail_send_email whenever you're responding to a received message.", {
+    messageId: z.string().describe("Gmail API id of the message being replied to (e.g. from gmail_search_emails)"),
+    body: z.string().describe("Reply body (plain text)"),
+    htmlBody: z.string().optional().describe("HTML version of the reply body"),
+    mimeType: z.enum(["text/plain", "text/html", "multipart/alternative"]).optional().default("text/plain"),
+    replyAll: z.boolean().optional().default(false).describe("Reply to the sender plus all other recipients (To+Cc), excluding yourself. Default false replies only to the sender."),
+    cc: z.array(z.string()).optional().describe("Extra CC recipients to add on top of those computed for the reply"),
+    bcc: z.array(z.string()).optional().describe("BCC recipients"),
+    attachments: z.array(attachmentSchema).optional().describe("Files to attach, each { path | content_base64, filename?, mime_type? }"),
+  }, async (opts) => {
+    const original = await api.users.messages.get({
+      userId: "me",
+      id: opts.messageId,
+      format: "metadata",
+      metadataHeaders: ["Message-ID", "References", "Subject", "From", "To", "Cc"],
+    });
+    const headers = original.data.payload?.headers;
+    const originalHeaders: OriginalMessageHeaders = {
+      messageIdHeader: getHeader(headers, "message-id"),
+      references: getHeader(headers, "references"),
+      subject: getHeader(headers, "subject"),
+      from: getHeader(headers, "from"),
+      to: getHeader(headers, "to"),
+      cc: getHeader(headers, "cc"),
+    };
+    const selfEmail = opts.replyAll ? await getSelfEmail() : undefined;
+    const reply = buildReplyHeaders(originalHeaders, { replyAll: opts.replyAll, selfEmail });
+    const cc = [...reply.cc, ...(opts.cc || [])];
+    const attachments = await resolveAttachments(opts.attachments);
+
+    const raw = encodeBase64Url(buildRawEmail({
+      to: reply.to,
+      cc: cc.length ? cc : undefined,
+      bcc: opts.bcc,
+      subject: reply.subject,
+      body: opts.body,
+      htmlBody: opts.htmlBody,
+      mimeType: opts.mimeType,
+      inReplyTo: reply.inReplyTo || undefined,
+      references: reply.references || undefined,
+      attachments,
+    }));
+    const res = await api.users.messages.send({
+      userId: "me",
+      requestBody: { raw, threadId: original.data.threadId || undefined },
+    });
+    return textResult({ id: res.data.id, threadId: res.data.threadId, to: reply.to, cc, subject: reply.subject });
   });
 
   server.tool("gmail_modify_email", "Modify email labels (add/remove)", {
@@ -304,5 +430,119 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     }
     await writeFile(path, buffer);
     return textResult({ path, size: buffer.byteLength });
+  });
+
+  // Per-message body snippet cap for thread reads: a whole thread can be many
+  // long messages, so each is trimmed to keep the aggregate response bounded.
+  const THREAD_BODY_MAX = 2000;
+  function pruneThreadMessage(msg: gmail_v1.Schema$Message): Record<string, unknown> {
+    const headers = msg.payload?.headers;
+    const body = extractBody(msg.payload);
+    let text = body.text || (body.html ? htmlToText(body.html) : "");
+    if (text.length > THREAD_BODY_MAX) text = `${text.slice(0, THREAD_BODY_MAX)}\n\n[truncated]`;
+    return {
+      id: msg.id,
+      from: getHeader(headers, "from"),
+      to: getHeader(headers, "to"),
+      cc: getHeader(headers, "cc"),
+      date: getHeader(headers, "date"),
+      subject: getHeader(headers, "subject"),
+      body: text,
+    };
+  }
+
+  server.tool("gmail_read_thread", "Read an entire email thread (conversation) at once — every message's headers and a trimmed body — given a thread id. Use this instead of gmail_read_email when you need the full back-and-forth context of a conversation.", {
+    threadId: z.string().describe("Gmail thread id (the threadId field on any message in the thread)"),
+    format: z.enum(["full", "metadata"]).optional().default("full").describe("full includes trimmed message bodies; metadata returns headers only"),
+  }, async ({ threadId, format }) => {
+    const res = await api.users.threads.get({
+      userId: "me",
+      id: threadId,
+      format,
+      ...(format === "metadata" ? { metadataHeaders: ["From", "To", "Cc", "Date", "Subject"] } : {}),
+    });
+    return textResult({
+      threadId: res.data.id,
+      messageCount: res.data.messages?.length || 0,
+      messages: res.data.messages?.map(pruneThreadMessage) || [],
+    });
+  });
+
+  server.tool("gmail_get_profile", "Get the authenticated user's Gmail profile: their email address plus total message/thread counts.", {}, async () => {
+    const res = await api.users.getProfile({ userId: "me" });
+    return textResult({
+      emailAddress: res.data.emailAddress,
+      messagesTotal: res.data.messagesTotal,
+      threadsTotal: res.data.threadsTotal,
+      historyId: res.data.historyId,
+    });
+  });
+
+  server.tool("gmail_list_drafts", "List saved email drafts (draft id + a summary of each). Send one with gmail_send_draft or discard it with gmail_delete_draft.", {
+    maxResults: z.number().optional().describe("Maximum number of drafts to return"),
+    pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
+  }, async ({ maxResults, pageToken }) => {
+    const res = await api.users.drafts.list({ userId: "me", maxResults: maxResults || 20, pageToken });
+    if (!res.data.drafts?.length) return textResult({ drafts: [], nextPageToken: res.data.nextPageToken });
+
+    const settled = await withConcurrencyLimit(res.data.drafts, 5, async (d) => {
+      const full = await api.users.drafts.get({ userId: "me", id: d.id!, format: "metadata" });
+      const headers = full.data.message?.payload?.headers;
+      return {
+        draftId: full.data.id,
+        messageId: full.data.message?.id,
+        threadId: full.data.message?.threadId,
+        to: getHeader(headers, "to"),
+        subject: getHeader(headers, "subject"),
+        snippet: full.data.message?.snippet,
+      };
+    });
+    const drafts = settled.filter((r) => r.status === "fulfilled").map((r) => (r as PromiseFulfilledResult<unknown>).value);
+    return textResult({ drafts, nextPageToken: res.data.nextPageToken });
+  });
+
+  server.tool("gmail_send_draft", "Send an existing draft by its draft id.", {
+    draftId: z.string().describe("Id of the draft to send (from gmail_list_drafts)"),
+  }, async ({ draftId }) => {
+    const res = await api.users.drafts.send({ userId: "me", requestBody: { id: draftId } });
+    return textResult({ id: res.data.id, threadId: res.data.threadId, labelIds: res.data.labelIds });
+  });
+
+  server.tool("gmail_delete_draft", "Permanently delete a draft by its draft id (discards it without sending).", {
+    draftId: z.string().describe("Id of the draft to delete"),
+  }, async ({ draftId }) => {
+    await api.users.drafts.delete({ userId: "me", id: draftId });
+    return textResult({ success: true, draftId });
+  });
+
+  server.tool("gmail_get_vacation", "Get the current vacation responder (out-of-office auto-reply) settings.", {}, async () => {
+    const res = await api.users.settings.getVacation({ userId: "me" });
+    return textResult(res.data);
+  });
+
+  server.tool("gmail_set_vacation", "Enable or disable the vacation responder (out-of-office auto-reply). Set enableAutoReply=false to turn it off.", {
+    enableAutoReply: z.boolean().describe("Whether the auto-reply is active"),
+    responseSubject: z.string().optional().describe("Subject line of the auto-reply"),
+    responseBodyPlainText: z.string().optional().describe("Plain-text auto-reply body"),
+    responseBodyHtml: z.string().optional().describe("HTML auto-reply body"),
+    restrictToContacts: z.boolean().optional().describe("Only auto-reply to people in your contacts"),
+    restrictToDomain: z.boolean().optional().describe("Only auto-reply to people in your organization's domain"),
+    startTime: z.string().optional().describe("Start time as epoch milliseconds (string). Omit to start immediately."),
+    endTime: z.string().optional().describe("End time as epoch milliseconds (string). Omit for no end."),
+  }, async (opts) => {
+    const res = await api.users.settings.updateVacation({
+      userId: "me",
+      requestBody: {
+        enableAutoReply: opts.enableAutoReply,
+        responseSubject: opts.responseSubject,
+        responseBodyPlainText: opts.responseBodyPlainText,
+        responseBodyHtml: opts.responseBodyHtml,
+        restrictToContacts: opts.restrictToContacts,
+        restrictToDomain: opts.restrictToDomain,
+        startTime: opts.startTime,
+        endTime: opts.endTime,
+      },
+    });
+    return textResult(res.data);
   });
 }
