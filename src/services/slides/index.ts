@@ -21,13 +21,13 @@ function tempPdfPath(prefix: string): string {
 }
 
 export function registerSlidesTools(server: McpServer, ctx: ServiceContext): void {
-  const api = () => google.slides({ version: "v1", auth: ctx.auth });
-  const driveApi = () => google.drive({ version: "v3", auth: ctx.auth });
+  const api = google.slides({ version: "v1", auth: ctx.auth });
+  const driveApi = google.drive({ version: "v3", auth: ctx.auth });
 
   server.tool("slides_create_presentation", "Create a new Google Slides presentation", {
     title: z.string(),
   }, async ({ title }) => {
-    const res = await api().presentations.create({ requestBody: { title } });
+    const res = await api.presentations.create({ requestBody: { title } });
     return textResult({
       presentationId: res.data.presentationId,
       title: res.data.title,
@@ -39,7 +39,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
   server.tool("slides_get_presentation", "Get presentation metadata and slide list", {
     presentationId: z.string(),
   }, async ({ presentationId }) => {
-    const res = await api().presentations.get({ presentationId });
+    const res = await api.presentations.get({ presentationId });
     return textResult({
       presentationId: res.data.presentationId,
       title: res.data.title,
@@ -64,7 +64,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
         slideLayoutReference: layoutId ? { layoutId } : undefined,
       },
     }];
-    const res = await api().presentations.batchUpdate({ presentationId, requestBody: { requests } });
+    const res = await api.presentations.batchUpdate({ presentationId, requestBody: { requests } });
     const slideId = res.data.replies?.[0]?.createSlide?.objectId;
     return textResult({ slideId });
   });
@@ -73,7 +73,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     presentationId: z.string(),
     slideObjectId: z.string(),
   }, async ({ presentationId, slideObjectId }) => {
-    await api().presentations.batchUpdate({
+    await api.presentations.batchUpdate({
       presentationId,
       requestBody: { requests: [{ deleteObject: { objectId: slideObjectId } }] },
     });
@@ -85,7 +85,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     slideObjectId: z.string(),
     insertionIndex: z.number().optional(),
   }, async ({ presentationId, slideObjectId, insertionIndex }) => {
-    const res = await api().presentations.batchUpdate({
+    const res = await api.presentations.batchUpdate({
       presentationId,
       requestBody: {
         requests: [{ duplicateObject: { objectId: slideObjectId } }],
@@ -100,7 +100,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     slideObjectIds: z.array(z.string()).describe("Slide IDs in the desired order"),
     insertionIndex: z.number().describe("Index to move slides to"),
   }, async ({ presentationId, slideObjectIds, insertionIndex }) => {
-    await api().presentations.batchUpdate({
+    await api.presentations.batchUpdate({
       presentationId,
       requestBody: {
         requests: [{ updateSlidesPosition: { slideObjectIds, insertionIndex } }],
@@ -120,7 +120,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
   }, async ({ presentationId, slideObjectId, text, x, y, width, height }) => {
     const boxId = uniqueId("textbox");
     const emu = (pts: number) => pts * 12700;
-    await api().presentations.batchUpdate({
+    await api.presentations.batchUpdate({
       presentationId,
       requestBody: {
         requests: [
@@ -155,7 +155,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
   }, async ({ presentationId, slideObjectId, imageUrl, x, y, width, height }) => {
     const imageId = uniqueId("image");
     const emu = (pts: number) => pts * 12700;
-    await api().presentations.batchUpdate({
+    await api.presentations.batchUpdate({
       presentationId,
       requestBody: {
         requests: [{
@@ -185,7 +185,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
   }, async ({ presentationId, slideObjectId, shapeType, x, y, width, height }) => {
     const shapeId = uniqueId("shape");
     const emu = (pts: number) => pts * 12700;
-    await api().presentations.batchUpdate({
+    await api.presentations.batchUpdate({
       presentationId,
       requestBody: {
         requests: [{
@@ -218,7 +218,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     const ytMatch = videoUrl.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]+)/);
     if (!ytMatch) return textResult({ error: "Could not extract YouTube video ID from URL" });
 
-    await api().presentations.batchUpdate({
+    await api.presentations.batchUpdate({
       presentationId,
       requestBody: {
         requests: [{
@@ -248,7 +248,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
   }, async ({ presentationId, slideObjectId, audioUrl, linkText, x, y }) => {
     const boxId = uniqueId("audio_link");
     const emu = (pts: number) => pts * 12700;
-    await api().presentations.batchUpdate({
+    await api.presentations.batchUpdate({
       presentationId,
       requestBody: {
         requests: [
@@ -297,7 +297,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     if (fontFamily) { style.fontFamily = fontFamily; fields.push("fontFamily"); }
     if (foregroundColor) { style.foregroundColor = { opaqueColor: { rgbColor: foregroundColor } }; fields.push("foregroundColor"); }
 
-    await api().presentations.batchUpdate({
+    await api.presentations.batchUpdate({
       presentationId,
       requestBody: {
         requests: [{
@@ -323,7 +323,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     if (spaceAbove !== undefined) { style.spaceAbove = { magnitude: spaceAbove, unit: "PT" }; fields.push("spaceAbove"); }
     if (spaceBelow !== undefined) { style.spaceBelow = { magnitude: spaceBelow, unit: "PT" }; fields.push("spaceBelow"); }
 
-    await api().presentations.batchUpdate({
+    await api.presentations.batchUpdate({
       presentationId,
       requestBody: {
         requests: [{
@@ -338,7 +338,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     presentationId: z.string(),
     outputPath: z.string().optional().describe("Local path to save the PDF. If omitted, writes to a temp file and returns its path."),
   }, async ({ presentationId, outputPath }) => {
-    const res = await driveApi().files.export(
+    const res = await driveApi.files.export(
       { fileId: presentationId, mimeType: "application/pdf" },
       { responseType: "arraybuffer" }
     );
@@ -353,11 +353,11 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     slideObjectId: z.string(),
     outputPath: z.string().optional().describe("Local path to save the single-page PDF. If omitted, writes to a temp file and returns its path."),
   }, async ({ presentationId, slideObjectId, outputPath }) => {
-    const pres = await api().presentations.get({ presentationId, fields: "slides.objectId" });
+    const pres = await api.presentations.get({ presentationId, fields: "slides.objectId" });
     const slideIndex = pres.data.slides?.findIndex((s) => s.objectId === slideObjectId);
     if (slideIndex === undefined || slideIndex < 0) return textResult({ error: "Slide not found" });
 
-    const res = await driveApi().files.export(
+    const res = await driveApi.files.export(
       { fileId: presentationId, mimeType: "application/pdf" },
       { responseType: "arraybuffer" }
     );
@@ -381,14 +381,14 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     presentationId: z.string(),
     slideObjectId: z.string().optional().describe("Specific slide to thumbnail (defaults to first slide)"),
   }, async ({ presentationId, slideObjectId }) => {
-    const pres = await api().presentations.get({ presentationId });
+    const pres = await api.presentations.get({ presentationId, fields: "slides(objectId)" });
     const targetSlide = slideObjectId
       ? pres.data.slides?.find((s) => s.objectId === slideObjectId)
       : pres.data.slides?.[0];
 
     if (!targetSlide) return textResult({ error: "Slide not found" });
 
-    const res = await api().presentations.pages.getThumbnail({
+    const res = await api.presentations.pages.getThumbnail({
       presentationId,
       pageObjectId: targetSlide.objectId!,
     });
