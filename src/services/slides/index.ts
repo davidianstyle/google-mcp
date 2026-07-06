@@ -1,8 +1,24 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { google } from "googleapis";
 import { z } from "zod";
+import { PDFDocument } from "pdf-lib";
+import { writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
+
+// Random suffix appended to Date.now()-based element IDs so two elements
+// created within the same millisecond (a real risk under concurrent or
+// scripted calls) never collide.
+function uniqueId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${randomBytes(4).toString("hex")}`;
+}
+
+function tempPdfPath(prefix: string): string {
+  return join(tmpdir(), `${prefix}-${Date.now()}-${randomBytes(4).toString("hex")}.pdf`);
+}
 
 export function registerSlidesTools(server: McpServer, ctx: ServiceContext): void {
   const api = () => google.slides({ version: "v1", auth: ctx.auth });
@@ -102,7 +118,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     width: z.number().optional().default(400),
     height: z.number().optional().default(50),
   }, async ({ presentationId, slideObjectId, text, x, y, width, height }) => {
-    const boxId = `textbox_${Date.now()}`;
+    const boxId = uniqueId("textbox");
     const emu = (pts: number) => pts * 12700;
     await api().presentations.batchUpdate({
       presentationId,
@@ -137,7 +153,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     width: z.number().optional().default(300),
     height: z.number().optional().default(200),
   }, async ({ presentationId, slideObjectId, imageUrl, x, y, width, height }) => {
-    const imageId = `image_${Date.now()}`;
+    const imageId = uniqueId("image");
     const emu = (pts: number) => pts * 12700;
     await api().presentations.batchUpdate({
       presentationId,
@@ -167,7 +183,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     width: z.number().optional().default(200),
     height: z.number().optional().default(100),
   }, async ({ presentationId, slideObjectId, shapeType, x, y, width, height }) => {
-    const shapeId = `shape_${Date.now()}`;
+    const shapeId = uniqueId("shape");
     const emu = (pts: number) => pts * 12700;
     await api().presentations.batchUpdate({
       presentationId,
@@ -197,7 +213,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     width: z.number().optional().default(400),
     height: z.number().optional().default(300),
   }, async ({ presentationId, slideObjectId, videoUrl, x, y, width, height }) => {
-    const videoId = `video_${Date.now()}`;
+    const videoId = uniqueId("video");
     const emu = (pts: number) => pts * 12700;
     const ytMatch = videoUrl.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]+)/);
     if (!ytMatch) return textResult({ error: "Could not extract YouTube video ID from URL" });
@@ -230,7 +246,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     x: z.number().optional().default(100),
     y: z.number().optional().default(100),
   }, async ({ presentationId, slideObjectId, audioUrl, linkText, x, y }) => {
-    const boxId = `audio_link_${Date.now()}`;
+    const boxId = uniqueId("audio_link");
     const emu = (pts: number) => pts * 12700;
     await api().presentations.batchUpdate({
       presentationId,
@@ -320,26 +336,24 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
 
   server.tool("slides_export_as_pdf", "Export entire presentation as PDF", {
     presentationId: z.string(),
-    outputPath: z.string().optional().describe("Local path to save the PDF"),
+    outputPath: z.string().optional().describe("Local path to save the PDF. If omitted, writes to a temp file and returns its path."),
   }, async ({ presentationId, outputPath }) => {
     const res = await driveApi().files.export(
       { fileId: presentationId, mimeType: "application/pdf" },
       { responseType: "arraybuffer" }
     );
-    if (outputPath) {
-      const { writeFileSync } = await import("node:fs");
-      writeFileSync(outputPath, Buffer.from(res.data as ArrayBuffer));
-      return textResult({ success: true, path: outputPath });
-    }
-    const base64 = Buffer.from(res.data as ArrayBuffer).toString("base64");
-    return textResult({ success: true, base64Length: base64.length, note: "PDF exported as base64" });
+    const bytes = Buffer.from(res.data as ArrayBuffer);
+    const path = outputPath || tempPdfPath(`slides-${presentationId}`);
+    await writeFile(path, bytes);
+    return textResult({ success: true, path, bytes: bytes.byteLength });
   });
 
-  server.tool("slides_export_slide_as_pdf", "Export a single slide as PDF", {
+  server.tool("slides_export_slide_as_pdf", "Export a single slide as a standalone one-page PDF", {
     presentationId: z.string(),
     slideObjectId: z.string(),
-  }, async ({ presentationId, slideObjectId }) => {
-    const pres = await api().presentations.get({ presentationId });
+    outputPath: z.string().optional().describe("Local path to save the single-page PDF. If omitted, writes to a temp file and returns its path."),
+  }, async ({ presentationId, slideObjectId, outputPath }) => {
+    const pres = await api().presentations.get({ presentationId, fields: "slides.objectId" });
     const slideIndex = pres.data.slides?.findIndex((s) => s.objectId === slideObjectId);
     if (slideIndex === undefined || slideIndex < 0) return textResult({ error: "Slide not found" });
 
@@ -347,7 +361,20 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
       { fileId: presentationId, mimeType: "application/pdf" },
       { responseType: "arraybuffer" }
     );
-    return textResult({ success: true, note: `Exported full presentation as PDF. Slide ${slideIndex + 1} extraction requires a PDF library.` });
+    const fullBytes = new Uint8Array(res.data as ArrayBuffer);
+    const srcDoc = await PDFDocument.load(fullBytes);
+    if (slideIndex >= srcDoc.getPageCount()) {
+      return textResult({ error: `Slide index ${slideIndex} out of range for the exported PDF (${srcDoc.getPageCount()} pages)` });
+    }
+
+    const outDoc = await PDFDocument.create();
+    const [copiedPage] = await outDoc.copyPages(srcDoc, [slideIndex]);
+    outDoc.addPage(copiedPage);
+    const outBytes = await outDoc.save();
+
+    const path = outputPath || tempPdfPath(`slide-${presentationId}-${slideIndex}`);
+    await writeFile(path, outBytes);
+    return textResult({ success: true, path, slideIndex, bytes: outBytes.byteLength });
   });
 
   server.tool("slides_get_thumbnail", "Get a thumbnail image of a presentation", {
