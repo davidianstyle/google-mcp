@@ -3,6 +3,7 @@ import { google, docs_v1, drive_v3 } from "googleapis";
 import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
+import { concatMarkdownForAppend } from "./markdown.js";
 
 function extractPlainText(body: docs_v1.Schema$Body | undefined): string {
   if (!body?.content) return "";
@@ -126,38 +127,6 @@ function selectTabBody(doc: docs_v1.Schema$Document, tabId: string | undefined):
   return tabs[0]?.documentTab?.body;
 }
 
-function extractMarkdown(body: docs_v1.Schema$Body | undefined): string {
-  if (!body?.content) return "";
-  let md = "";
-  for (const el of body.content) {
-    if (el.paragraph) {
-      const style = el.paragraph.paragraphStyle?.namedStyleType;
-      let prefix = "";
-      if (style === "HEADING_1") prefix = "# ";
-      else if (style === "HEADING_2") prefix = "## ";
-      else if (style === "HEADING_3") prefix = "### ";
-      else if (style === "HEADING_4") prefix = "#### ";
-      else if (style === "HEADING_5") prefix = "##### ";
-      else if (style === "HEADING_6") prefix = "###### ";
-
-      let line = "";
-      for (const pe of el.paragraph.elements || []) {
-        if (pe.textRun) {
-          let t = pe.textRun.content || "";
-          const ts = pe.textRun.textStyle;
-          if (ts?.bold) t = `**${t.trim()}** `;
-          if (ts?.italic) t = `*${t.trim()}* `;
-          if (ts?.link?.url) t = `[${t.trim()}](${ts.link.url})`;
-          line += t;
-        }
-      }
-      md += prefix + line;
-      if (!line.endsWith("\n")) md += "\n";
-    }
-  }
-  return md;
-}
-
 // Default cap on docs_read_document output (all formats) so a large document
 // can't blow past the model's context budget. Callers can raise it via the
 // maxLength param when they genuinely need more.
@@ -167,13 +136,32 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
   const docsApi = google.docs({ version: "v1", auth: ctx.auth });
   const driveApi = google.drive({ version: "v3", auth: ctx.auth });
 
-  server.tool("docs_read_document", "Read the content of a Google Document", {
+  server.tool("docs_read_document", "Read the content of a Google Document. format 'markdown' returns Google Drive's own native markdown export (full-fidelity headings, bold/italic, links, lists, tables) — not a lossy reconstruction. Note: markdown exports the WHOLE document; the tabId filter only applies to 'text'/'json'.", {
     documentId: z.string().describe("Document ID from the URL"),
     format: z.enum(["text", "markdown", "json"]).optional().default("text"),
     maxLength: z.number().optional().describe(`Max characters (text/markdown) or JSON-string length (json) to return before capping. Defaults to ${DEFAULT_MAX_LENGTH}.`),
-    tabId: z.string().optional().describe("Read only this tab's content (see docs_list_tabs for tab IDs). Defaults to the document's first tab."),
+    tabId: z.string().optional().describe("Read only this tab's content (see docs_list_tabs for tab IDs). Defaults to the document's first tab. Ignored for format 'markdown' (Drive exports the whole document)."),
   }, async ({ documentId, format, maxLength, tabId }) => {
     const cap = maxLength ?? DEFAULT_MAX_LENGTH;
+
+    // Markdown uses Drive's native Docs->markdown converter for full fidelity,
+    // rather than reconstructing markdown from the Docs JSON. Drive exports the
+    // whole document (no per-tab export), so tabId is not honored here.
+    if (format === "markdown") {
+      const res = await driveApi.files.export(
+        { fileId: documentId, mimeType: "text/markdown" },
+        { responseType: "text" }
+      );
+      const content = typeof res.data === "string" ? res.data : String(res.data);
+      const totalLength = content.length;
+      const truncated = totalLength > cap;
+      const shown = truncated ? content.slice(0, cap) : content;
+      const header = truncated
+        ? `Content (showing first ${cap} of ${totalLength} characters; pass a larger maxLength to see more):`
+        : `Content (${totalLength} characters):`;
+      return textResult(`${header}\n${shown}`);
+    }
+
     const doc = await docsApi.documents.get({ documentId, includeTabsContent: true });
 
     if (format === "json") {
@@ -186,7 +174,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     }
 
     const body = selectTabBody(doc.data, tabId);
-    const content = format === "markdown" ? extractMarkdown(body) : extractPlainText(body);
+    const content = extractPlainText(body);
     const totalLength = content.length;
     const truncated = totalLength > cap;
     const shown = truncated ? content.slice(0, cap) : content;
@@ -257,17 +245,21 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     return textResult({ success: true, appendedAt: endIndex });
   });
 
-  server.tool("docs_append_markdown", "Append markdown-formatted text to the document", {
+  server.tool("docs_append_markdown", "Append markdown to the end of a document, rendered as NATIVE Google Docs content (real headings, bold/italic, links, lists, tables) via Drive's markdown converter. Works by exporting the current doc to markdown, concatenating your markdown, and re-importing the whole thing. CAVEAT: because this rewrites the entire document, comments, suggestions, and named anchors/bookmarks in the existing content are NOT preserved. For surgical edits that keep those, use docs_insert_text / docs_apply_* instead.", {
     documentId: z.string(),
     markdown: z.string(),
   }, async ({ documentId, markdown }) => {
-    const doc = await docsApi.documents.get({ documentId, fields: "body.content(endIndex)" });
-    const endIndex = (doc.data.body?.content?.at(-1)?.endIndex || 2) - 1;
-    await docsApi.documents.batchUpdate({
-      documentId,
-      requestBody: { requests: [{ insertText: { text: markdown, location: { index: endIndex } } }] },
+    const exported = await driveApi.files.export(
+      { fileId: documentId, mimeType: "text/markdown" },
+      { responseType: "text" }
+    );
+    const existing = typeof exported.data === "string" ? exported.data : String(exported.data);
+    const combined = concatMarkdownForAppend(existing, markdown);
+    await driveApi.files.update({
+      fileId: documentId,
+      media: { mimeType: "text/markdown", body: combined },
     });
-    return textResult({ success: true, appendedAt: endIndex, note: "Inserted as plain text; markdown rendering depends on the viewer." });
+    return textResult({ success: true, note: "Appended as native Docs content. Full-document re-import: comments/anchors in existing content may not survive." });
   });
 
   server.tool("docs_modify_text", "Replace text in a range", {
@@ -288,19 +280,15 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     return textResult({ success: true });
   });
 
-  server.tool("docs_replace_with_markdown", "Replace the entire document body with markdown content", {
+  server.tool("docs_replace_with_markdown", "Replace the ENTIRE document with markdown, rendered as native Google Docs content (real headings, bold/italic, links, lists, tables) via Drive's markdown converter — not plain text. This overwrites all existing content. CAVEAT: because it re-imports the whole file, existing comments, suggestions, and named anchors/bookmarks are NOT preserved. Best for generating a document from scratch or wholesale rewrites; use docs_insert_text / docs_modify_text / docs_apply_* for edits that must keep those.", {
     documentId: z.string(),
     markdown: z.string(),
   }, async ({ documentId, markdown }) => {
-    const doc = await docsApi.documents.get({ documentId, fields: "body.content(endIndex)" });
-    const endIndex = (doc.data.body?.content?.at(-1)?.endIndex || 2) - 1;
-    const requests: docs_v1.Schema$Request[] = [];
-    if (endIndex > 1) {
-      requests.push({ deleteContentRange: { range: { startIndex: 1, endIndex } } });
-    }
-    requests.push({ insertText: { text: markdown, location: { index: 1 } } });
-    await docsApi.documents.batchUpdate({ documentId, requestBody: { requests } });
-    return textResult({ success: true });
+    await driveApi.files.update({
+      fileId: documentId,
+      media: { mimeType: "text/markdown", body: markdown },
+    });
+    return textResult({ success: true, note: "Replaced with native Docs content converted from markdown. Comments/anchors from prior content may not survive." });
   });
 
   server.tool("docs_find_and_replace", "Find and replace text in a document", {
