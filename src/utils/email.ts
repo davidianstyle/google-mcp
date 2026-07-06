@@ -46,6 +46,44 @@ export function getHeader(headers: gmail_v1.Schema$MessagePartHeader[] | undefin
   return headers?.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value || "";
 }
 
+/** Strips CR/LF out of a header value so it can't inject additional header lines (or a body separator). */
+function sanitizeHeaderValue(value: string): string {
+  return value.replace(/[\r\n]+/g, " ").trim();
+}
+
+/**
+ * RFC 2047-encodes a header value if it contains any non-ASCII characters
+ * (e.g. "=?UTF-8?B?...?="), after stripping CR/LF. ASCII-only values are
+ * returned unchanged (untouched, unencoded) so the common case stays
+ * human-readable in the raw message.
+ */
+function encodeHeaderValue(value: string): string {
+  const sanitized = sanitizeHeaderValue(value);
+  // eslint-disable-next-line no-control-regex
+  if (!/[^\x00-\x7F]/.test(sanitized)) return sanitized;
+  return `=?UTF-8?B?${Buffer.from(sanitized, "utf-8").toString("base64")}?=`;
+}
+
+function header(name: string, value: string): string {
+  return `${name}: ${encodeHeaderValue(value)}`;
+}
+
+/** Wraps a base64 string into CRLF-separated 76-character lines (RFC 2045 §6.8). */
+function wrapBase64(base64: string): string {
+  const lines: string[] = [];
+  for (let i = 0; i < base64.length; i += 76) lines.push(base64.slice(i, i + 76));
+  return lines.join("\r\n");
+}
+
+/**
+ * Base64-encodes a MIME body part so arbitrarily long lines in the source
+ * text (which would otherwise violate RFC 5322's 998-octet line limit)
+ * become short, safe base64 lines instead.
+ */
+function encodeBodyBase64(text: string): string {
+  return wrapBase64(Buffer.from(text, "utf-8").toString("base64"));
+}
+
 export function buildRawEmail(opts: {
   to: string[];
   subject: string;
@@ -61,22 +99,22 @@ export function buildRawEmail(opts: {
   const boundary = `boundary_${Date.now()}`;
   const headers: string[] = [];
 
-  headers.push(`To: ${opts.to.join(", ")}`);
-  if (opts.from) headers.push(`From: ${opts.from}`);
-  if (opts.cc?.length) headers.push(`Cc: ${opts.cc.join(", ")}`);
-  if (opts.bcc?.length) headers.push(`Bcc: ${opts.bcc.join(", ")}`);
-  headers.push(`Subject: ${opts.subject}`);
+  headers.push(header("To", opts.to.join(", ")));
+  if (opts.from) headers.push(header("From", opts.from));
+  if (opts.cc?.length) headers.push(header("Cc", opts.cc.join(", ")));
+  if (opts.bcc?.length) headers.push(header("Bcc", opts.bcc.join(", ")));
+  headers.push(header("Subject", opts.subject));
   if (opts.inReplyTo) {
-    headers.push(`In-Reply-To: ${opts.inReplyTo}`);
-    headers.push(`References: ${opts.references || opts.inReplyTo}`);
+    headers.push(header("In-Reply-To", opts.inReplyTo));
+    headers.push(header("References", opts.references || opts.inReplyTo));
   }
 
   if (opts.htmlBody && opts.mimeType === "multipart/alternative") {
     headers.push(`MIME-Version: 1.0`);
     headers.push(`Content-Type: multipart/alternative; boundary="${boundary}"`);
     const parts = [
-      `--${boundary}\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n${opts.body}`,
-      `--${boundary}\r\nContent-Type: text/html; charset="UTF-8"\r\n\r\n${opts.htmlBody}`,
+      `--${boundary}\r\nContent-Type: text/plain; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBodyBase64(opts.body)}`,
+      `--${boundary}\r\nContent-Type: text/html; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodeBodyBase64(opts.htmlBody)}`,
       `--${boundary}--`,
     ];
     return headers.join("\r\n") + "\r\n\r\n" + parts.join("\r\n");
@@ -85,11 +123,13 @@ export function buildRawEmail(opts: {
   if (opts.htmlBody || opts.mimeType === "text/html") {
     headers.push(`MIME-Version: 1.0`);
     headers.push(`Content-Type: text/html; charset="UTF-8"`);
-    return headers.join("\r\n") + "\r\n\r\n" + (opts.htmlBody || opts.body);
+    headers.push(`Content-Transfer-Encoding: base64`);
+    return headers.join("\r\n") + "\r\n\r\n" + encodeBodyBase64(opts.htmlBody || opts.body);
   }
 
   headers.push(`Content-Type: text/plain; charset="UTF-8"`);
-  return headers.join("\r\n") + "\r\n\r\n" + opts.body;
+  headers.push(`Content-Transfer-Encoding: base64`);
+  return headers.join("\r\n") + "\r\n\r\n" + encodeBodyBase64(opts.body);
 }
 
 export interface AttachmentInfo {
@@ -123,6 +163,56 @@ export function extractAttachments(payload: gmail_v1.Schema$MessagePart | undefi
   return attachments;
 }
 
+const NAMED_HTML_ENTITIES: Record<string, string> = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  copy: "©", reg: "®", trade: "™",
+  mdash: "—", ndash: "–", hellip: "…",
+  lsquo: "‘", rsquo: "’", ldquo: "“", rdquo: "”",
+};
+
+function decodeHtmlEntities(input: string): string {
+  return input.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, entity: string) => {
+    if (entity[0] === "#") {
+      const isHex = entity[1] === "x" || entity[1] === "X";
+      const codePoint = isHex ? parseInt(entity.slice(2), 16) : parseInt(entity.slice(1), 10);
+      if (Number.isNaN(codePoint)) return match;
+      try {
+        return String.fromCodePoint(codePoint);
+      } catch {
+        return match;
+      }
+    }
+    return NAMED_HTML_ENTITIES[entity] ?? match;
+  });
+}
+
+const DEFAULT_HTML_TEXT_MAX_LENGTH = 50_000;
+
+/**
+ * Basic HTML -> plain text conversion used as a fallback when a message has
+ * no text/plain part: drops <script>/<style> blocks entirely, turns <br>
+ * into newlines, strips all remaining tags, decodes common HTML entities,
+ * and caps the result length (with a note) so a huge HTML email can't blow
+ * past response size limits.
+ */
+export function htmlToText(html: string, maxLength = DEFAULT_HTML_TEXT_MAX_LENGTH): string {
+  let text = html.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, "");
+  text = text.replace(/<br\s*\/?>/gi, "\n");
+  text = text.replace(/<[^>]+>/g, "");
+  text = decodeHtmlEntities(text);
+  text = text
+    .replace(/[ \t]+/g, " ")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  if (text.length > maxLength) {
+    const shown = text.slice(0, maxLength);
+    return `${shown}\n\n[truncated: showing ${maxLength} of ${text.length} characters]`;
+  }
+  return text;
+}
+
 export function formatMessage(msg: gmail_v1.Schema$Message): Record<string, unknown> {
   const headers = msg.payload?.headers;
   const body = extractBody(msg.payload);
@@ -137,7 +227,7 @@ export function formatMessage(msg: gmail_v1.Schema$Message): Record<string, unkn
     to: getHeader(headers, "to"),
     cc: getHeader(headers, "cc"),
     date: getHeader(headers, "date"),
-    body: body.text || body.html,
+    body: body.text || (body.html ? htmlToText(body.html) : ""),
     ...(attachments.length > 0 ? { attachments } : {}),
   };
 }
