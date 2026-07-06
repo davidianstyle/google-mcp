@@ -1,8 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { google } from "googleapis";
+import { google, sheets_v4 } from "googleapis";
 import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
+import { parseA1Range } from "../../utils/a1.js";
 
 export function registerSheetsTools(server: McpServer, ctx: ServiceContext): void {
   const api = () => google.sheets({ version: "v4", auth: ctx.auth });
@@ -413,13 +414,56 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
 
   server.tool("sheets_insert_chart", "Insert a chart into a sheet", {
     spreadsheetId: z.string(),
-    sheetId: z.number(),
+    sheetId: z.number().describe("Sheet ID where the chart will be anchored"),
     chartType: z.enum(["BAR", "LINE", "PIE", "COLUMN", "AREA", "SCATTER"]),
     title: z.string().optional(),
-    dataRange: z.string().describe("A1 notation of the data range for the chart"),
+    dataRange: z.string().describe(
+      "A1 notation of the data range for the chart, e.g. 'Sheet1!A1:B100', bare 'A1:B100', or whole-column 'A:B'. " +
+      "The first column is the domain (labels); any remaining columns become separate series. " +
+      "If the range has no sheet-name prefix, it's assumed to be on the anchor sheet (sheetId)."
+    ),
     anchorRowIndex: z.number().optional().default(0),
     anchorColumnIndex: z.number().optional().default(0),
   }, async ({ spreadsheetId, sheetId, chartType, title, dataRange, anchorRowIndex, anchorColumnIndex }) => {
+    const parsed = parseA1Range(dataRange);
+
+    let dataSheetId = sheetId;
+    if (parsed.sheetName) {
+      const info = await api().spreadsheets.get({
+        spreadsheetId,
+        fields: "sheets.properties(sheetId,title)",
+      });
+      const match = info.data.sheets?.find((s) => s.properties?.title === parsed.sheetName);
+      if (!match || match.properties?.sheetId == null) {
+        throw new Error(`Sheet "${parsed.sheetName}" not found in spreadsheet ${spreadsheetId}`);
+      }
+      dataSheetId = match.properties.sheetId;
+    }
+
+    if (parsed.startColumnIndex === undefined || parsed.endColumnIndex === undefined) {
+      throw new Error(`dataRange "${dataRange}" must specify a column range`);
+    }
+    if (parsed.endColumnIndex - parsed.startColumnIndex < 2) {
+      throw new Error(`dataRange "${dataRange}" must include at least 2 columns: one domain column and at least one series column`);
+    }
+
+    const baseSource: sheets_v4.Schema$GridRange = {
+      sheetId: dataSheetId,
+      startRowIndex: parsed.startRowIndex,
+      endRowIndex: parsed.endRowIndex,
+    };
+    const domainSources: sheets_v4.Schema$GridRange[] = [{
+      ...baseSource,
+      startColumnIndex: parsed.startColumnIndex,
+      endColumnIndex: parsed.startColumnIndex + 1,
+    }];
+    const series: sheets_v4.Schema$BasicChartSeries[] = [];
+    for (let c = parsed.startColumnIndex + 1; c < parsed.endColumnIndex; c++) {
+      series.push({
+        series: { sourceRange: { sources: [{ ...baseSource, startColumnIndex: c, endColumnIndex: c + 1 }] } },
+      });
+    }
+
     const res = await api().spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
@@ -430,8 +474,8 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
                 title,
                 basicChart: {
                   chartType,
-                  domains: [{ domain: { sourceRange: { sources: [{ sheetId, startRowIndex: 0, endRowIndex: 100, startColumnIndex: 0, endColumnIndex: 1 }] } } }],
-                  series: [{ series: { sourceRange: { sources: [{ sheetId, startRowIndex: 0, endRowIndex: 100, startColumnIndex: 1, endColumnIndex: 2 }] } } }],
+                  domains: [{ domain: { sourceRange: { sources: domainSources } } }],
+                  series,
                 },
               },
               position: { overlayPosition: { anchorCell: { sheetId, rowIndex: anchorRowIndex, columnIndex: anchorColumnIndex } } },
