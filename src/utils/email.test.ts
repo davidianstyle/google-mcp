@@ -36,6 +36,34 @@ describe("buildRawEmail header hardening", () => {
     expect(raw.split("\r\n")).toContain("Subject: Plain subject");
   });
 
+  it("never RFC 2047-encodes address headers, keeping the addr-spec literal", () => {
+    const raw = buildRawEmail({
+      to: ["José García <jose@example.com>"],
+      cc: ["Zoë <zoe@example.com>"],
+      subject: "test",
+      body: "hi",
+    });
+    const lines = raw.split("\r\n");
+    const toLine = lines.find((l) => l.startsWith("To:"));
+    const ccLine = lines.find((l) => l.startsWith("Cc:"));
+    // Encoding the whole value would swallow the email address into a
+    // base64 blob (invalid per RFC 5322 — encoded-words can't appear in
+    // an addr-spec). The address must stay literal and readable.
+    expect(toLine).toContain("<jose@example.com>");
+    expect(toLine).not.toContain("=?UTF-8?B?");
+    expect(ccLine).toContain("<zoe@example.com>");
+    expect(ccLine).not.toContain("=?UTF-8?B?");
+  });
+
+  it("still strips CRLF injection from address headers", () => {
+    const raw = buildRawEmail({
+      to: ["a@b.com\r\nX-Evil: 1"],
+      subject: "test",
+      body: "hi",
+    });
+    expect(raw.split("\r\n").some((l) => /^X-Evil:/i.test(l))).toBe(false);
+  });
+
   it("base64-encodes a long-line body so no raw line can exceed RFC 5322's 998-octet limit", () => {
     const longLine = "a".repeat(2000);
     const raw = buildRawEmail({ to: ["a@b.com"], subject: "test", body: longLine });

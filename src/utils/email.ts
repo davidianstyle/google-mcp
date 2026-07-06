@@ -64,8 +64,21 @@ function encodeHeaderValue(value: string): string {
   return `=?UTF-8?B?${Buffer.from(sanitized, "utf-8").toString("base64")}?=`;
 }
 
+/** Free-text header (Subject etc.): CRLF-sanitized and RFC 2047-encoded when non-ASCII. */
 function header(name: string, value: string): string {
   return `${name}: ${encodeHeaderValue(value)}`;
+}
+
+/**
+ * Address header (To/Cc/Bcc/From): CRLF-sanitized only. RFC 2047
+ * encoded-words are not allowed inside an addr-spec, so base64-encoding the
+ * whole value would swallow the email address into an opaque blob and break
+ * parsing/delivery. Non-ASCII display names pass through as raw UTF-8,
+ * which Gmail accepts (SMTPUTF8) — imperfect for strict RFC 5322 relays,
+ * but strictly better than corrupting the address.
+ */
+function addressHeader(name: string, value: string): string {
+  return `${name}: ${sanitizeHeaderValue(value)}`;
 }
 
 /** Wraps a base64 string into CRLF-separated 76-character lines (RFC 2045 §6.8). */
@@ -99,14 +112,15 @@ export function buildRawEmail(opts: {
   const boundary = `boundary_${Date.now()}`;
   const headers: string[] = [];
 
-  headers.push(header("To", opts.to.join(", ")));
-  if (opts.from) headers.push(header("From", opts.from));
-  if (opts.cc?.length) headers.push(header("Cc", opts.cc.join(", ")));
-  if (opts.bcc?.length) headers.push(header("Bcc", opts.bcc.join(", ")));
+  headers.push(addressHeader("To", opts.to.join(", ")));
+  if (opts.from) headers.push(addressHeader("From", opts.from));
+  if (opts.cc?.length) headers.push(addressHeader("Cc", opts.cc.join(", ")));
+  if (opts.bcc?.length) headers.push(addressHeader("Bcc", opts.bcc.join(", ")));
   headers.push(header("Subject", opts.subject));
   if (opts.inReplyTo) {
-    headers.push(header("In-Reply-To", opts.inReplyTo));
-    headers.push(header("References", opts.references || opts.inReplyTo));
+    // Message-ID references are ASCII identifiers; sanitize only.
+    headers.push(addressHeader("In-Reply-To", opts.inReplyTo));
+    headers.push(addressHeader("References", opts.references || opts.inReplyTo));
   }
 
   if (opts.htmlBody && opts.mimeType === "multipart/alternative") {
