@@ -21,14 +21,15 @@ const FILTER_TEMPLATES: Record<string, { criteria: Record<string, unknown>; acti
 const MAX_INLINE_ATTACHMENT_BYTES = 2 * 1024 * 1024;
 
 export function registerGmailTools(server: McpServer, ctx: ServiceContext): void {
-  const api = () => google.gmail({ version: "v1", auth: ctx.auth });
+  const api = google.gmail({ version: "v1", auth: ctx.auth });
 
   server.tool("gmail_search_emails", "Search emails using Gmail search syntax", {
     query: z.string().describe("Gmail search query (e.g., 'from:example@gmail.com')"),
     maxResults: z.number().optional().describe("Maximum number of results to return"),
-  }, async ({ query, maxResults }) => {
-    const gmail = api();
-    const res = await gmail.users.messages.list({ userId: "me", q: query, maxResults: maxResults || 10 });
+    pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
+  }, async ({ query, maxResults, pageToken }) => {
+    const gmail = api;
+    const res = await gmail.users.messages.list({ userId: "me", q: query, maxResults: maxResults || 10, pageToken });
     if (!res.data.messages?.length) return textResult("No messages found.");
 
     const ids = res.data.messages;
@@ -54,13 +55,17 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       }
     });
 
-    return textResult(failures.length ? { messages, failures } : messages);
+    return textResult({
+      messages,
+      nextPageToken: res.data.nextPageToken,
+      ...(failures.length ? { failures } : {}),
+    });
   });
 
   server.tool("gmail_read_email", "Read the full content of an email", {
     messageId: z.string().describe("ID of the email message to retrieve"),
   }, async ({ messageId }) => {
-    const res = await api().users.messages.get({ userId: "me", id: messageId, format: "full" });
+    const res = await api.users.messages.get({ userId: "me", id: messageId, format: "full" });
     return textResult(formatMessage(res.data));
   });
 
@@ -76,7 +81,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     inReplyTo: z.string().optional().describe("Message ID being replied to"),
   }, async (opts) => {
     const raw = encodeBase64Url(buildRawEmail(opts));
-    const res = await api().users.messages.send({
+    const res = await api.users.messages.send({
       userId: "me",
       requestBody: { raw, threadId: opts.threadId },
     });
@@ -95,7 +100,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     inReplyTo: z.string().optional().describe("Message ID being replied to"),
   }, async (opts) => {
     const raw = encodeBase64Url(buildRawEmail(opts));
-    const res = await api().users.drafts.create({
+    const res = await api.users.drafts.create({
       userId: "me",
       requestBody: { message: { raw, threadId: opts.threadId } },
     });
@@ -107,7 +112,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     addLabelIds: z.array(z.string()).optional().describe("Label IDs to add"),
     removeLabelIds: z.array(z.string()).optional().describe("Label IDs to remove"),
   }, async ({ messageId, addLabelIds, removeLabelIds }) => {
-    const res = await api().users.messages.modify({
+    const res = await api.users.messages.modify({
       userId: "me", id: messageId,
       requestBody: { addLabelIds: addLabelIds || [], removeLabelIds: removeLabelIds || [] },
     });
@@ -117,14 +122,14 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
   server.tool("gmail_delete_email", "Move an email to trash", {
     messageId: z.string().describe("ID of the message to trash"),
   }, async ({ messageId }) => {
-    await api().users.messages.trash({ userId: "me", id: messageId });
+    await api.users.messages.trash({ userId: "me", id: messageId });
     return textResult({ success: true, messageId });
   });
 
   server.tool("gmail_batch_delete_emails", "Permanently delete multiple emails", {
     messageIds: z.array(z.string()).describe("IDs of messages to delete"),
   }, async ({ messageIds }) => {
-    await api().users.messages.batchDelete({ userId: "me", requestBody: { ids: messageIds } });
+    await api.users.messages.batchDelete({ userId: "me", requestBody: { ids: messageIds } });
     return textResult({ success: true, count: messageIds.length });
   });
 
@@ -133,7 +138,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     addLabelIds: z.array(z.string()).optional().describe("Label IDs to add"),
     removeLabelIds: z.array(z.string()).optional().describe("Label IDs to remove"),
   }, async ({ messageIds, addLabelIds, removeLabelIds }) => {
-    await api().users.messages.batchModify({
+    await api.users.messages.batchModify({
       userId: "me",
       requestBody: { ids: messageIds, addLabelIds: addLabelIds || [], removeLabelIds: removeLabelIds || [] },
     });
@@ -158,7 +163,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       forward: z.string().optional(),
     }).describe("Actions to perform on matching emails"),
   }, async ({ criteria, action }) => {
-    const res = await api().users.settings.filters.create({
+    const res = await api.users.settings.filters.create({
       userId: "me",
       requestBody: { criteria, action },
     });
@@ -193,26 +198,26 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     if (customizations?.removeLabelIds) action.removeLabelIds = customizations.removeLabelIds;
     if (customizations?.forward) action.forward = customizations.forward;
 
-    const res = await api().users.settings.filters.create({ userId: "me", requestBody: { criteria, action } });
+    const res = await api.users.settings.filters.create({ userId: "me", requestBody: { criteria, action } });
     return textResult({ id: res.data.id, template, criteria: res.data.criteria, action: res.data.action });
   });
 
   server.tool("gmail_delete_filter", "Delete a Gmail filter", {
     filterId: z.string().describe("ID of the filter to delete"),
   }, async ({ filterId }) => {
-    await api().users.settings.filters.delete({ userId: "me", id: filterId });
+    await api.users.settings.filters.delete({ userId: "me", id: filterId });
     return textResult({ success: true, filterId });
   });
 
   server.tool("gmail_get_filter", "Get details of a Gmail filter", {
     filterId: z.string().describe("ID of the filter to retrieve"),
   }, async ({ filterId }) => {
-    const res = await api().users.settings.filters.get({ userId: "me", id: filterId });
+    const res = await api.users.settings.filters.get({ userId: "me", id: filterId });
     return textResult(res.data);
   });
 
   server.tool("gmail_list_filters", "List all Gmail filters", {}, async () => {
-    const res = await api().users.settings.filters.list({ userId: "me" });
+    const res = await api.users.settings.filters.list({ userId: "me" });
     return textResult(res.data.filter || []);
   });
 
@@ -221,7 +226,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     messageListVisibility: z.enum(["show", "hide"]).optional(),
     labelListVisibility: z.enum(["labelShow", "labelShowIfUnread", "labelHide"]).optional(),
   }, async ({ name, messageListVisibility, labelListVisibility }) => {
-    const res = await api().users.labels.create({
+    const res = await api.users.labels.create({
       userId: "me",
       requestBody: { name, messageListVisibility, labelListVisibility },
     });
@@ -231,7 +236,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
   server.tool("gmail_delete_label", "Delete a Gmail label", {
     labelId: z.string().describe("ID of the label to delete"),
   }, async ({ labelId }) => {
-    await api().users.labels.delete({ userId: "me", id: labelId });
+    await api.users.labels.delete({ userId: "me", id: labelId });
     return textResult({ success: true, labelId });
   });
 
@@ -241,7 +246,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     messageListVisibility: z.enum(["show", "hide"]).optional(),
     labelListVisibility: z.enum(["labelShow", "labelShowIfUnread", "labelHide"]).optional(),
   }, async ({ labelId, name, messageListVisibility, labelListVisibility }) => {
-    const res = await api().users.labels.update({
+    const res = await api.users.labels.update({
       userId: "me", id: labelId,
       requestBody: { name, messageListVisibility, labelListVisibility },
     });
@@ -249,14 +254,14 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
   });
 
   server.tool("gmail_list_labels", "List all Gmail labels", {}, async () => {
-    const res = await api().users.labels.list({ userId: "me" });
+    const res = await api.users.labels.list({ userId: "me" });
     return textResult(res.data.labels?.map((l) => ({ id: l.id, name: l.name, type: l.type })) || []);
   });
 
   server.tool("gmail_get_or_create_label", "Get a label by name, creating it if it doesn't exist", {
     name: z.string().describe("Label name"),
   }, async ({ name }) => {
-    const gmail = api();
+    const gmail = api;
     const labels = await gmail.users.labels.list({ userId: "me" });
     const existing = labels.data.labels?.find((l) => l.name?.toLowerCase() === name.toLowerCase());
     if (existing) return textResult({ id: existing.id, name: existing.name, created: false });
@@ -268,7 +273,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
   server.tool("gmail_list_attachments", "List attachments on an email (returns attachment IDs, filenames, sizes)", {
     messageId: z.string().describe("ID of the email message"),
   }, async ({ messageId }) => {
-    const res = await api().users.messages.get({ userId: "me", id: messageId, format: "full" });
+    const res = await api.users.messages.get({ userId: "me", id: messageId, format: "full" });
     const attachments = extractAttachments(res.data.payload);
     return textResult(attachments.length > 0 ? attachments : "No attachments found.");
   });
@@ -278,7 +283,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     attachmentId: z.string().describe("ID of the attachment to download"),
     outputPath: z.string().optional().describe("Local path to write the attachment to. If omitted, small attachments are returned inline as base64 and large attachments are written to a temp path instead."),
   }, async ({ messageId, attachmentId, outputPath }) => {
-    const res = await api().users.messages.attachments.get({
+    const res = await api.users.messages.attachments.get({
       userId: "me", messageId, id: attachmentId,
     });
     const data = res.data.data;
