@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildRawEmail,
   buildReplyHeaders,
+  capTextLength,
+  formatMessage,
   htmlToText,
   parseAddressList,
   type OriginalMessageHeaders,
@@ -220,5 +222,48 @@ describe("htmlToText", () => {
   it("does not truncate content within the length cap", () => {
     const text = htmlToText("<p>short</p>", 1000);
     expect(text).toBe("short");
+  });
+});
+
+describe("capTextLength", () => {
+  it("returns short text unchanged", () => {
+    expect(capTextLength("hello", 100)).toBe("hello");
+  });
+
+  it("caps oversized text and appends a truncation note", () => {
+    const capped = capTextLength("a".repeat(50), 20);
+    expect(capped.startsWith("a".repeat(20))).toBe(true);
+    expect(capped).toContain("[truncated: showing 20 of 50 characters]");
+  });
+});
+
+describe("formatMessage body capping", () => {
+  it("caps an oversized plain-text body at 50k chars with a truncation note", () => {
+    const bigBody = "x".repeat(60_000);
+    const msg = {
+      id: "m1",
+      payload: {
+        mimeType: "text/plain",
+        headers: [{ name: "Subject", value: "big" }],
+        body: { data: Buffer.from(bigBody).toString("base64url") },
+      },
+    };
+    const formatted = formatMessage(msg);
+    const body = formatted.body as string;
+    expect(body.length).toBeLessThan(60_000);
+    expect(body.startsWith("x".repeat(50_000))).toBe(true);
+    expect(body).toContain("[truncated: showing 50000 of 60000 characters]");
+  });
+
+  it("leaves a normal-sized plain-text body untouched", () => {
+    const msg = {
+      id: "m2",
+      payload: {
+        mimeType: "text/plain",
+        headers: [],
+        body: { data: Buffer.from("short body").toString("base64url") },
+      },
+    };
+    expect(formatMessage(msg).body).toBe("short body");
   });
 });

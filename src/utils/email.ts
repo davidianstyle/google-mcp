@@ -333,7 +333,18 @@ function decodeHtmlEntities(input: string): string {
   });
 }
 
-const DEFAULT_HTML_TEXT_MAX_LENGTH = 50_000;
+const DEFAULT_BODY_TEXT_MAX_LENGTH = 50_000;
+
+/**
+ * Caps `text` at `maxLength` characters, appending a truncation note when
+ * anything was cut. Shared by the HTML-fallback path and plain-text bodies
+ * so a huge email of either kind can't blow past response size limits.
+ */
+export function capTextLength(text: string, maxLength = DEFAULT_BODY_TEXT_MAX_LENGTH): string {
+  if (text.length <= maxLength) return text;
+  const shown = text.slice(0, maxLength);
+  return `${shown}\n\n[truncated: showing ${maxLength} of ${text.length} characters]`;
+}
 
 /**
  * Basic HTML -> plain text conversion used as a fallback when a message has
@@ -342,7 +353,7 @@ const DEFAULT_HTML_TEXT_MAX_LENGTH = 50_000;
  * and caps the result length (with a note) so a huge HTML email can't blow
  * past response size limits.
  */
-export function htmlToText(html: string, maxLength = DEFAULT_HTML_TEXT_MAX_LENGTH): string {
+export function htmlToText(html: string, maxLength = DEFAULT_BODY_TEXT_MAX_LENGTH): string {
   let text = html.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, "");
   text = text.replace(/<br\s*\/?>/gi, "\n");
   text = text.replace(/<[^>]+>/g, "");
@@ -353,11 +364,7 @@ export function htmlToText(html: string, maxLength = DEFAULT_HTML_TEXT_MAX_LENGT
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
-  if (text.length > maxLength) {
-    const shown = text.slice(0, maxLength);
-    return `${shown}\n\n[truncated: showing ${maxLength} of ${text.length} characters]`;
-  }
-  return text;
+  return capTextLength(text, maxLength);
 }
 
 export function formatMessage(msg: gmail_v1.Schema$Message): Record<string, unknown> {
@@ -374,7 +381,9 @@ export function formatMessage(msg: gmail_v1.Schema$Message): Record<string, unkn
     to: getHeader(headers, "to"),
     cc: getHeader(headers, "cc"),
     date: getHeader(headers, "date"),
-    body: body.text || (body.html ? htmlToText(body.html) : ""),
+    // Both body kinds go through the same 50k cap: htmlToText caps internally,
+    // and plain text is capped here (previously it was returned in full).
+    body: body.text ? capTextLength(body.text) : body.html ? htmlToText(body.html) : "",
     ...(attachments.length > 0 ? { attachments } : {}),
   };
 }
