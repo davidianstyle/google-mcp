@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { docs_v1 } from "googleapis";
-import { findInsertedTable } from "./index.js";
+import { findInsertedTable, summarizeDocumentStructure } from "./index.js";
 
 /**
  * Per the Docs API (Schema$InsertTableRequest.location): "A newline
@@ -46,5 +46,77 @@ describe("findInsertedTable", () => {
 
   it("returns undefined for missing content", () => {
     expect(findInsertedTable(undefined, 10)).toBeUndefined();
+  });
+});
+
+describe("summarizeDocumentStructure", () => {
+  const paragraphWithImage: docs_v1.Schema$StructuralElement = {
+    startIndex: 1,
+    endIndex: 2,
+    paragraph: { elements: [{ inlineObjectElement: { inlineObjectId: "img1" } }] },
+  };
+  const plainParagraph: docs_v1.Schema$StructuralElement = {
+    startIndex: 2,
+    endIndex: 10,
+    paragraph: { elements: [{ textRun: { content: "hello" } }] },
+  };
+  const tableElement: docs_v1.Schema$StructuralElement = {
+    startIndex: 10,
+    endIndex: 20,
+    table: { rows: 2, columns: 2, tableRows: [] },
+  };
+
+  it("summarizes a single-tab (no-tabs) document by counting body elements", () => {
+    const doc: docs_v1.Schema$Document = {
+      documentId: "doc1",
+      title: "My Doc",
+      revisionId: "rev1",
+      body: { content: [paragraphWithImage, plainParagraph, tableElement] },
+    };
+    const summary = summarizeDocumentStructure(doc);
+    expect(summary.documentId).toBe("doc1");
+    expect(summary.title).toBe("My Doc");
+    expect(summary.revisionId).toBe("rev1");
+    expect(summary.tabCount).toBe(1);
+    expect(summary.tabs).toEqual([
+      { tabId: undefined, title: "My Doc", paragraphs: 2, tables: 1, images: 1 },
+    ]);
+  });
+
+  it("handles a document with no body content at all", () => {
+    const doc: docs_v1.Schema$Document = { documentId: "empty", title: "Empty" };
+    const summary = summarizeDocumentStructure(doc);
+    expect(summary.tabCount).toBe(1);
+    expect(summary.tabs[0]).toEqual({ tabId: undefined, title: "Empty", paragraphs: 0, tables: 0, images: 0 });
+  });
+
+  it("summarizes each tab separately, including nested child tabs", () => {
+    const doc: docs_v1.Schema$Document = {
+      documentId: "doc2",
+      title: "Tabbed Doc",
+      tabs: [
+        {
+          tabProperties: { tabId: "t1", title: "Tab One" },
+          documentTab: { body: { content: [plainParagraph] } },
+          childTabs: [
+            {
+              tabProperties: { tabId: "t1a", title: "Tab One Child" },
+              documentTab: { body: { content: [tableElement] } },
+            },
+          ],
+        },
+        {
+          tabProperties: { tabId: "t2", title: "Tab Two" },
+          documentTab: { body: { content: [paragraphWithImage, tableElement] } },
+        },
+      ],
+    };
+    const summary = summarizeDocumentStructure(doc);
+    expect(summary.tabCount).toBe(3);
+    expect(summary.tabs).toEqual([
+      { tabId: "t1", title: "Tab One", paragraphs: 1, tables: 0, images: 0 },
+      { tabId: "t1a", title: "Tab One Child", paragraphs: 0, tables: 1, images: 0 },
+      { tabId: "t2", title: "Tab Two", paragraphs: 1, tables: 1, images: 1 },
+    ]);
   });
 });

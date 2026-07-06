@@ -40,6 +40,68 @@ export function findInsertedTable(
   return content?.find((e) => e.table && e.startIndex === insertionIndex + 1)?.table ?? undefined;
 }
 
+interface TabStructureSummary {
+  tabId: string | undefined;
+  title: string | undefined;
+  paragraphs: number;
+  tables: number;
+  images: number;
+}
+
+function countBodyElements(body: docs_v1.Schema$Body | undefined): { paragraphs: number; tables: number; images: number } {
+  let paragraphs = 0;
+  let tables = 0;
+  let images = 0;
+  for (const el of body?.content || []) {
+    if (el.paragraph) {
+      paragraphs++;
+      for (const pe of el.paragraph.elements || []) {
+        if (pe.inlineObjectElement) images++;
+      }
+    }
+    if (el.table) tables++;
+  }
+  return { paragraphs, tables, images };
+}
+
+function collectTabSummaries(tabs: docs_v1.Schema$Tab[] | undefined): TabStructureSummary[] {
+  const out: TabStructureSummary[] = [];
+  for (const tab of tabs || []) {
+    out.push({
+      tabId: tab.tabProperties?.tabId ?? undefined,
+      title: tab.tabProperties?.title ?? undefined,
+      ...countBodyElements(tab.documentTab?.body),
+    });
+    out.push(...collectTabSummaries(tab.childTabs));
+  }
+  return out;
+}
+
+/**
+ * Builds a small structural summary of a document (title/tabs/element
+ * counts) in place of the full JSON body — used by docs_read_document when
+ * the full JSON would blow past the size cap.
+ */
+export function summarizeDocumentStructure(doc: docs_v1.Schema$Document): {
+  documentId: string | undefined;
+  title: string | undefined;
+  revisionId: string | undefined;
+  tabCount: number;
+  tabs: TabStructureSummary[];
+} {
+  const tabs = doc.tabs?.length
+    ? collectTabSummaries(doc.tabs)
+    : [{ tabId: undefined, title: doc.title ?? undefined, ...countBodyElements(doc.body) }];
+
+  return {
+    documentId: doc.documentId ?? undefined,
+    title: doc.title ?? undefined,
+    revisionId: doc.revisionId ?? undefined,
+    tabCount: tabs.length,
+    tabs,
+  };
+}
+
 function findTab(tabs: docs_v1.Schema$Tab[] | undefined, tabId: string): docs_v1.Schema$Tab | undefined {
   for (const tab of tabs || []) {
     if (tab.tabProperties?.tabId === tabId) return tab;
@@ -96,34 +158,51 @@ function extractMarkdown(body: docs_v1.Schema$Body | undefined): string {
   return md;
 }
 
+// Default cap on docs_read_document output (all formats) so a large document
+// can't blow past the model's context budget. Callers can raise it via the
+// maxLength param when they genuinely need more.
+const DEFAULT_MAX_LENGTH = 50_000;
+
 export function registerDocsTools(server: McpServer, ctx: ServiceContext): void {
-  const docsApi = () => google.docs({ version: "v1", auth: ctx.auth });
-  const driveApi = () => google.drive({ version: "v3", auth: ctx.auth });
+  const docsApi = google.docs({ version: "v1", auth: ctx.auth });
+  const driveApi = google.drive({ version: "v3", auth: ctx.auth });
 
   server.tool("docs_read_document", "Read the content of a Google Document", {
     documentId: z.string().describe("Document ID from the URL"),
     format: z.enum(["text", "markdown", "json"]).optional().default("text"),
-    maxLength: z.number().optional(),
+    maxLength: z.number().optional().describe(`Max characters (text/markdown) or JSON-string length (json) to return before capping. Defaults to ${DEFAULT_MAX_LENGTH}.`),
     tabId: z.string().optional().describe("Read only this tab's content (see docs_list_tabs for tab IDs). Defaults to the document's first tab."),
   }, async ({ documentId, format, maxLength, tabId }) => {
-    const doc = await docsApi().documents.get({ documentId, includeTabsContent: true });
-    if (format === "json") return textResult(doc.data);
+    const cap = maxLength ?? DEFAULT_MAX_LENGTH;
+    const doc = await docsApi.documents.get({ documentId, includeTabsContent: true });
+
+    if (format === "json") {
+      const json = JSON.stringify(doc.data);
+      if (json.length <= cap) return textResult(doc.data);
+      return textResult({
+        note: `Document JSON is ${json.length} characters, exceeding the ${cap}-character cap (maxLength). Returning a structural summary instead — use format: "text" or "markdown" for readable content, or pass a larger maxLength to force the full JSON.`,
+        structure: summarizeDocumentStructure(doc.data),
+      });
+    }
 
     const body = selectTabBody(doc.data, tabId);
-    let content: string;
-    if (format === "markdown") content = extractMarkdown(body);
-    else content = extractPlainText(body);
-    if (maxLength && content.length > maxLength) content = content.slice(0, maxLength);
-    return textResult(`Content (${content.length} characters):\n${content}`);
+    const content = format === "markdown" ? extractMarkdown(body) : extractPlainText(body);
+    const totalLength = content.length;
+    const truncated = totalLength > cap;
+    const shown = truncated ? content.slice(0, cap) : content;
+    const header = truncated
+      ? `Content (showing first ${cap} of ${totalLength} characters; pass a larger maxLength to see more):`
+      : `Content (${totalLength} characters):`;
+    return textResult(`${header}\n${shown}`);
   });
 
   server.tool("docs_create_document", "Create a new Google Document", {
     title: z.string(),
     parentFolderId: z.string().optional(),
   }, async ({ title, parentFolderId }) => {
-    const doc = await docsApi().documents.create({ requestBody: { title } });
+    const doc = await docsApi.documents.create({ requestBody: { title } });
     if (parentFolderId && doc.data.documentId) {
-      await driveApi().files.update({ fileId: doc.data.documentId, addParents: parentFolderId, fields: "id" });
+      await driveApi.files.update({ fileId: doc.data.documentId, addParents: parentFolderId, fields: "id" });
     }
     return textResult({ documentId: doc.data.documentId, title: doc.data.title, url: `https://docs.google.com/document/d/${doc.data.documentId}/edit` });
   });
@@ -133,7 +212,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     title: z.string(),
     parentFolderId: z.string().optional(),
   }, async ({ templateDocumentId, title, parentFolderId }) => {
-    const copy = await driveApi().files.copy({
+    const copy = await driveApi.files.copy({
       fileId: templateDocumentId,
       requestBody: { name: title, parents: parentFolderId ? [parentFolderId] : undefined },
       fields: "id,name,webViewLink",
@@ -144,7 +223,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
   server.tool("docs_get_info", "Get document metadata", {
     documentId: z.string(),
   }, async ({ documentId }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId });
     return textResult({
       documentId: doc.data.documentId,
       title: doc.data.title,
@@ -158,7 +237,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     text: z.string(),
     index: z.number().describe("Character index to insert at (1 = start of body)"),
   }, async ({ documentId, text, index }) => {
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertText: { text, location: { index } } }] },
     });
@@ -169,9 +248,9 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     text: z.string(),
   }, async ({ documentId, text }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId, fields: "body.content(endIndex)" });
     const endIndex = (doc.data.body?.content?.at(-1)?.endIndex || 2) - 1;
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertText: { text, location: { index: endIndex } } }] },
     });
@@ -182,9 +261,9 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     markdown: z.string(),
   }, async ({ documentId, markdown }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId, fields: "body.content(endIndex)" });
     const endIndex = (doc.data.body?.content?.at(-1)?.endIndex || 2) - 1;
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertText: { text: markdown, location: { index: endIndex } } }] },
     });
@@ -197,7 +276,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     endIndex: z.number(),
     newText: z.string(),
   }, async ({ documentId, startIndex, endIndex, newText }) => {
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: {
         requests: [
@@ -213,14 +292,14 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     markdown: z.string(),
   }, async ({ documentId, markdown }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId, fields: "body.content(endIndex)" });
     const endIndex = (doc.data.body?.content?.at(-1)?.endIndex || 2) - 1;
     const requests: docs_v1.Schema$Request[] = [];
     if (endIndex > 1) {
       requests.push({ deleteContentRange: { range: { startIndex: 1, endIndex } } });
     }
     requests.push({ insertText: { text: markdown, location: { index: 1 } } });
-    await docsApi().documents.batchUpdate({ documentId, requestBody: { requests } });
+    await docsApi.documents.batchUpdate({ documentId, requestBody: { requests } });
     return textResult({ success: true });
   });
 
@@ -230,7 +309,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     replace: z.string(),
     matchCase: z.boolean().optional().default(false),
   }, async ({ documentId, find, replace, matchCase }) => {
-    const res = await docsApi().documents.batchUpdate({
+    const res = await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ replaceAllText: { containsText: { text: find, matchCase }, replaceText: replace } }] },
     });
@@ -246,7 +325,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     height: z.number().optional().describe("Height in points"),
   }, async ({ documentId, imageUri, index, width, height }) => {
     const size = width && height ? { width: { magnitude: width, unit: "PT" }, height: { magnitude: height, unit: "PT" } } : undefined;
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertInlineImage: { uri: imageUri, location: { index }, objectSize: size as unknown as undefined } }] },
     });
@@ -257,7 +336,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     index: z.number(),
   }, async ({ documentId, index }) => {
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertPageBreak: { location: { index } } }] },
     });
@@ -270,7 +349,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     columns: z.number(),
     index: z.number(),
   }, async ({ documentId, rows, columns, index }) => {
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertTable: { rows, columns, location: { index } } }] },
     });
@@ -284,7 +363,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
   }, async ({ documentId, data, index }) => {
     const rows = data.length;
     const columns = data[0]?.length || 1;
-    const docs = docsApi();
+    const docs = docsApi;
 
     await docs.documents.batchUpdate({
       documentId,
@@ -317,9 +396,9 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     rows: z.number(),
     columns: z.number(),
   }, async ({ documentId, rows, columns }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId, fields: "body.content(endIndex)" });
     const endIndex = (doc.data.body?.content?.at(-1)?.endIndex || 2) - 1;
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertTable: { rows, columns, location: { index: endIndex } } }] },
     });
@@ -330,7 +409,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     tableIndex: z.number().describe("0-based table index in the document"),
   }, async ({ documentId, tableIndex }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId });
     const tables = doc.data.body?.content?.filter((e) => e.table) || [];
     if (tableIndex >= tables.length) return textResult({ error: `Table index ${tableIndex} out of range (${tables.length} tables)` });
 
@@ -344,7 +423,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
   server.tool("docs_list_tables", "List all tables in a document", {
     documentId: z.string(),
   }, async ({ documentId }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId });
     const tables = doc.data.body?.content?.filter((e) => e.table) || [];
     return textResult(tables.map((t, i) => ({
       index: i,
@@ -359,12 +438,12 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     tableIndex: z.number(),
   }, async ({ documentId, tableIndex }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId });
     const tables = doc.data.body?.content?.filter((e) => e.table) || [];
     if (tableIndex >= tables.length) return textResult({ error: `Table index ${tableIndex} out of range` });
 
     const el = tables[tableIndex];
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ deleteContentRange: { range: { startIndex: el.startIndex!, endIndex: el.endIndex! } } }] },
     });
@@ -378,7 +457,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
   }, async ({ documentId, tableIndex, rows }) => {
     if (rows.length === 0) return textResult({ success: true, rowsAdded: 0 });
 
-    const docs = docsApi();
+    const docs = docsApi;
     const doc = await docs.documents.get({ documentId });
     const tables = doc.data.body?.content?.filter((e) => e.table) || [];
     if (tableIndex >= tables.length) return textResult({ error: "Table not found" });
@@ -432,7 +511,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     startCol: z.number(),
     data: z.array(z.array(z.string())),
   }, async ({ documentId, tableIndex, startRow, startCol, data }) => {
-    const docs = docsApi();
+    const docs = docsApi;
     const doc = await docs.documents.get({ documentId });
     const tables = doc.data.body?.content?.filter((e) => e.table) || [];
     if (tableIndex >= tables.length) return textResult({ error: "Table not found" });
@@ -483,7 +562,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     if (foregroundColor) { textStyle.foregroundColor = { color: { rgbColor: foregroundColor } }; fields.push("foregroundColor"); }
     if (link) { textStyle.link = { url: link }; fields.push("link"); }
 
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: {
         requests: [{ updateTextStyle: { textStyle, range: { startIndex, endIndex }, fields: fields.join(",") } }],
@@ -510,7 +589,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     if (spaceAbove !== undefined) { paragraphStyle.spaceAbove = { magnitude: spaceAbove, unit: "PT" }; fields.push("spaceAbove"); }
     if (spaceBelow !== undefined) { paragraphStyle.spaceBelow = { magnitude: spaceBelow, unit: "PT" }; fields.push("spaceBelow"); }
 
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: {
         requests: [{ updateParagraphStyle: { paragraphStyle, range: { startIndex, endIndex }, fields: fields.join(",") } }],
@@ -533,7 +612,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     if (timeFormat) dateElementProperties.timeFormat = timeFormat;
     if (timeZoneId) dateElementProperties.timeZoneId = timeZoneId;
     if (locale) dateElementProperties.locale = locale;
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertDate: { location: { index }, dateElementProperties } }] },
     });
@@ -546,7 +625,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     endIndex: z.number(),
     bulletPreset: z.string().optional().default("BULLET_DISC_CIRCLE_SQUARE").describe("Glyph preset, e.g. BULLET_DISC_CIRCLE_SQUARE, BULLET_CHECKBOX, NUMBERED_DECIMAL_ALPHA_ROMAN"),
   }, async ({ documentId, startIndex, endIndex, bulletPreset }) => {
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ createParagraphBullets: { range: { startIndex, endIndex }, bulletPreset } }] },
     });
@@ -558,7 +637,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     startIndex: z.number(),
     endIndex: z.number(),
   }, async ({ documentId, startIndex, endIndex }) => {
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ deleteParagraphBullets: { range: { startIndex, endIndex } } }] },
     });
@@ -572,7 +651,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     targetStartIndex: z.number(),
     targetEndIndex: z.number(),
   }, async ({ documentId, sourceStartIndex, sourceEndIndex, targetStartIndex, targetEndIndex }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId });
     let sourceStyle: docs_v1.Schema$TextStyle | undefined;
     for (const el of doc.data.body?.content || []) {
       for (const pe of el.paragraph?.elements || []) {
@@ -585,7 +664,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     }
     if (!sourceStyle) return textResult({ error: "Could not find source text style" });
 
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: {
         requests: [{ updateTextStyle: { textStyle: sourceStyle, range: { startIndex: targetStartIndex, endIndex: targetEndIndex }, fields: "*" } }],
@@ -597,7 +676,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
   server.tool("docs_list_tabs", "List all tabs in a document", {
     documentId: z.string(),
   }, async ({ documentId }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId });
     const tabs = doc.data.tabs || [{ tabProperties: { tabId: "default", title: doc.data.title } }];
     return textResult(tabs.map((t) => ({ tabId: t.tabProperties?.tabId, title: t.tabProperties?.title })));
   });
@@ -607,7 +686,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     content: z.string().describe("Comment text"),
     quotedText: z.string().optional().describe("Text in the document to anchor the comment to"),
   }, async ({ documentId, content, quotedText }) => {
-    const res = await driveApi().comments.create({
+    const res = await driveApi.comments.create({
       fileId: documentId,
       fields: "id,content,author,createdTime",
       requestBody: { content, quotedFileContent: quotedText ? { value: quotedText } : undefined },
@@ -619,7 +698,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     commentId: z.string(),
   }, async ({ documentId, commentId }) => {
-    const res = await driveApi().comments.get({
+    const res = await driveApi.comments.get({
       fileId: documentId, commentId,
       fields: "id,content,author,createdTime,resolved,replies",
     });
@@ -630,7 +709,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     includeDeleted: z.boolean().optional().default(false),
   }, async ({ documentId, includeDeleted }) => {
-    const drive = driveApi();
+    const drive = driveApi;
     const comments: drive_v3.Schema$Comment[] = [];
     let pageToken: string | undefined;
     do {
@@ -652,7 +731,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     commentId: z.string(),
     content: z.string(),
   }, async ({ documentId, commentId, content }) => {
-    const res = await driveApi().replies.create({
+    const res = await driveApi.replies.create({
       fileId: documentId, commentId,
       fields: "id,content,author,createdTime",
       requestBody: { content },
@@ -664,7 +743,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     commentId: z.string(),
   }, async ({ documentId, commentId }) => {
-    const res = await driveApi().comments.update({
+    const res = await driveApi.comments.update({
       fileId: documentId, commentId,
       fields: "id,resolved",
       requestBody: { resolved: true },
@@ -676,7 +755,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     commentId: z.string(),
   }, async ({ documentId, commentId }) => {
-    await driveApi().comments.delete({ fileId: documentId, commentId });
+    await driveApi.comments.delete({ fileId: documentId, commentId });
     return textResult({ success: true, commentId });
   });
 }
