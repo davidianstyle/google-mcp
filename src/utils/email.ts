@@ -1,7 +1,12 @@
 import { gmail_v1 } from "googleapis";
 
+/** Decodes a Gmail base64url string to raw bytes (safe for binary content like attachments). */
+export function decodeBase64UrlToBuffer(data: string): Buffer {
+  return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+}
+
 export function decodeBase64Url(data: string): string {
-  return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
+  return decodeBase64UrlToBuffer(data).toString("utf-8");
 }
 
 export function encodeBase64Url(data: string): string {

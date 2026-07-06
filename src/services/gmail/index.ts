@@ -1,17 +1,24 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { google } from "googleapis";
 import { z } from "zod";
+import { writeFile } from "node:fs/promises";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
-import { buildRawEmail, encodeBase64Url, extractAttachments, extractBody, formatMessage, getHeader } from "../../utils/email.js";
+import { buildRawEmail, decodeBase64UrlToBuffer, encodeBase64Url, extractAttachments, extractBody, formatMessage, getHeader } from "../../utils/email.js";
 import { withConcurrencyLimit } from "../../utils/concurrency.js";
 import { mapGoogleError } from "../../utils/errors.js";
+import { ensureCacheInitialized, maybePeriodicSweep, cachePath } from "../../utils/download-cache.js";
 
 const FILTER_TEMPLATES: Record<string, { criteria: Record<string, unknown>; action: Record<string, unknown> }> = {
   newsletter: { criteria: { query: "unsubscribe" }, action: { removeLabelIds: ["INBOX"] } },
   social_notifications: { criteria: { from: "notification" }, action: { removeLabelIds: ["INBOX"] } },
   auto_archive_noreply: { criteria: { from: "noreply" }, action: { removeLabelIds: ["INBOX"] } },
 };
+
+// Hard cap for inline (base64-in-response) attachment downloads, mirroring
+// drive_download_file's inline-mode cap: keeps tool responses from blowing
+// past MCP/LLM context budgets. Larger attachments are written to disk.
+const MAX_INLINE_ATTACHMENT_BYTES = 2 * 1024 * 1024;
 
 export function registerGmailTools(server: McpServer, ctx: ServiceContext): void {
   const api = () => google.gmail({ version: "v1", auth: ctx.auth });
@@ -171,7 +178,16 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     }).optional().describe("Customizations to apply on top of the template"),
   }, async ({ template, customizations }) => {
     const tpl = FILTER_TEMPLATES[template];
-    const criteria = { ...tpl.criteria, ...customizations };
+    // Split customizations into criteria-shaped keys vs action-shaped keys
+    // explicitly, rather than spreading the whole object into criteria —
+    // addLabelIds/removeLabelIds/forward are FilterAction fields, not
+    // FilterCriteria fields, and don't belong there.
+    const criteria: Record<string, unknown> = { ...tpl.criteria };
+    if (customizations?.from !== undefined) criteria.from = customizations.from;
+    if (customizations?.to !== undefined) criteria.to = customizations.to;
+    if (customizations?.subject !== undefined) criteria.subject = customizations.subject;
+    if (customizations?.query !== undefined) criteria.query = customizations.query;
+
     const action: Record<string, unknown> = { ...tpl.action };
     if (customizations?.addLabelIds) action.addLabelIds = customizations.addLabelIds;
     if (customizations?.removeLabelIds) action.removeLabelIds = customizations.removeLabelIds;
@@ -257,13 +273,31 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     return textResult(attachments.length > 0 ? attachments : "No attachments found.");
   });
 
-  server.tool("gmail_download_attachment", "Download an email attachment", {
+  server.tool("gmail_download_attachment", `Download an email attachment. Returns inline base64 for attachments up to ~${MAX_INLINE_ATTACHMENT_BYTES} bytes; larger attachments (or when outputPath is given) are written to disk instead and a path is returned.`, {
     messageId: z.string().describe("ID of the message containing the attachment"),
     attachmentId: z.string().describe("ID of the attachment to download"),
-  }, async ({ messageId, attachmentId }) => {
+    outputPath: z.string().optional().describe("Local path to write the attachment to. If omitted, small attachments are returned inline as base64 and large attachments are written to a temp path instead."),
+  }, async ({ messageId, attachmentId, outputPath }) => {
     const res = await api().users.messages.attachments.get({
       userId: "me", messageId, id: attachmentId,
     });
-    return textResult({ data: res.data.data, size: res.data.size });
+    const data = res.data.data;
+    if (!data) return textResult({ error: "Attachment has no data" });
+
+    const buffer = decodeBase64UrlToBuffer(data);
+    const sizeBytes = res.data.size ?? buffer.byteLength;
+
+    if (!outputPath && sizeBytes <= MAX_INLINE_ATTACHMENT_BYTES) {
+      return textResult({ data, size: sizeBytes, encoding: "base64url" });
+    }
+
+    let path = outputPath;
+    if (!path) {
+      await ensureCacheInitialized();
+      maybePeriodicSweep();
+      path = cachePath(`attachment-${attachmentId}`, "bin");
+    }
+    await writeFile(path, buffer);
+    return textResult({ path, size: buffer.byteLength });
   });
 }
