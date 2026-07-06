@@ -4,8 +4,32 @@ import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
 import { mapGoogleError } from "../../utils/errors.js";
+import { proposeTimes, parseHhMm, type Interval } from "../../utils/propose-times.js";
 
 import { calendar_v3 } from "googleapis";
+
+const remindersSchema = z.object({
+  useDefault: z.boolean(),
+  overrides: z.array(z.object({ method: z.enum(["email", "popup"]).default("popup"), minutes: z.number() })).optional(),
+});
+
+const outOfOfficePropertiesSchema = z.object({
+  autoDeclineMode: z.enum(["declineNone", "declineAllConflictingInvitations", "declineOnlyNewConflictingInvitations"]).optional(),
+  declineMessage: z.string().optional(),
+});
+
+const workingLocationPropertiesSchema = z.object({
+  type: z.enum(["homeOffice", "officeLocation", "customLocation"]),
+  homeOffice: z.record(z.string(), z.unknown()).optional().describe("Presence marker for working from home; pass {}"),
+  officeLocation: z.object({ buildingId: z.string().optional(), floorId: z.string().optional(), floorSectionId: z.string().optional(), deskId: z.string().optional(), label: z.string().optional() }).optional(),
+  customLocation: z.object({ label: z.string().optional() }).optional(),
+});
+
+const focusTimePropertiesSchema = z.object({
+  autoDeclineMode: z.enum(["declineNone", "declineAllConflictingInvitations", "declineOnlyNewConflictingInvitations"]).optional(),
+  declineMessage: z.string().optional(),
+  chatStatus: z.enum(["available", "doNotDisturb"]).optional(),
+});
 
 function formatEvent(e: calendar_v3.Schema$Event): Record<string, unknown> {
   return {
@@ -100,12 +124,14 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     maxResults: z.number().optional().describe("Maximum events to return"),
     pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
     includeDetails: z.boolean().optional().default(false).describe("Include full conferenceData per event. Default false always trims attendees to email+responseStatus and omits conferenceData to keep list responses small."),
-  }, async ({ calendarId, timeMin, timeMax, timeZone, maxResults, pageToken, includeDetails }) => {
+    eventTypes: z.array(z.enum(["default", "outOfOffice", "workingLocation", "focusTime", "birthday", "fromGmail"])).optional().describe("Filter to only these event types (e.g. ['outOfOffice'] to list out-of-office blocks)."),
+  }, async ({ calendarId, timeMin, timeMax, timeZone, maxResults, pageToken, includeDetails, eventTypes }) => {
     const res = await api.events.list({
       calendarId,
       timeMin, timeMax, timeZone,
       maxResults: maxResults || 50,
       pageToken,
+      eventTypes,
       singleEvents: true,
       orderBy: "startTime",
     });
@@ -131,14 +157,18 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
         conferenceSolutionKey: z.object({ type: z.enum(["hangoutsMeet", "eventHangout", "eventNamedHangout", "addOn"]) }),
       }),
     }).optional(),
-    reminders: z.object({
-      useDefault: z.boolean(),
-      overrides: z.array(z.object({ method: z.enum(["email", "popup"]).default("popup"), minutes: z.number() })).optional(),
-    }).optional(),
+    reminders: remindersSchema.optional(),
     sendUpdates: z.enum(["all", "externalOnly", "none"]).optional(),
     visibility: z.enum(["default", "public", "private", "confidential"]).optional(),
     transparency: z.enum(["opaque", "transparent"]).optional(),
     colorId: z.string().optional(),
+    guestsCanModify: z.boolean().optional(),
+    guestsCanInviteOthers: z.boolean().optional(),
+    guestsCanSeeOtherGuests: z.boolean().optional(),
+    eventType: z.enum(["default", "outOfOffice", "workingLocation", "focusTime"]).optional().describe("Special event type. outOfOffice/workingLocation/focusTime require the matching *Properties object and are single-attendee (self) events."),
+    outOfOfficeProperties: outOfOfficePropertiesSchema.optional().describe("Only with eventType=outOfOffice. autoDeclineMode controls whether conflicting invites are auto-declined."),
+    workingLocationProperties: workingLocationPropertiesSchema.optional().describe("Only with eventType=workingLocation. Set type plus the matching sub-object."),
+    focusTimeProperties: focusTimePropertiesSchema.optional().describe("Only with eventType=focusTime."),
   }, async (opts) => {
     const cal = api;
     const isAllDay = !opts.start.includes("T");
@@ -166,6 +196,13 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
         visibility: opts.visibility,
         transparency: opts.transparency,
         colorId: opts.colorId,
+        guestsCanModify: opts.guestsCanModify,
+        guestsCanInviteOthers: opts.guestsCanInviteOthers,
+        guestsCanSeeOtherGuests: opts.guestsCanSeeOtherGuests,
+        eventType: opts.eventType,
+        outOfOfficeProperties: opts.outOfOfficeProperties,
+        workingLocationProperties: opts.workingLocationProperties as calendar_v3.Schema$EventWorkingLocationProperties | undefined,
+        focusTimeProperties: opts.focusTimeProperties,
       },
     });
     return textResult(formatEvent(res.data ));
@@ -233,6 +270,13 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     timeZone: z.string().optional().describe("IANA timezone to apply to a new start/end. If omitted, the event's existing timezone is preserved."),
     sendUpdates: z.enum(["all", "externalOnly", "none"]).optional(),
     colorId: z.string().optional(),
+    recurrence: z.array(z.string()).optional().describe("RFC5545 recurrence rules (RRULE/RDATE/EXDATE). Replaces the event's existing recurrence."),
+    reminders: remindersSchema.optional(),
+    visibility: z.enum(["default", "public", "private", "confidential"]).optional(),
+    transparency: z.enum(["opaque", "transparent"]).optional().describe("opaque = busy, transparent = free"),
+    guestsCanModify: z.boolean().optional(),
+    guestsCanInviteOthers: z.boolean().optional(),
+    guestsCanSeeOtherGuests: z.boolean().optional(),
   }, async (opts) => {
     const cal = api;
     const requestBody: calendar_v3.Schema$Event = {};
@@ -242,6 +286,13 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     if (opts.location !== undefined) requestBody.location = opts.location;
     if (opts.attendees !== undefined) requestBody.attendees = opts.attendees;
     if (opts.colorId !== undefined) requestBody.colorId = opts.colorId;
+    if (opts.recurrence !== undefined) requestBody.recurrence = opts.recurrence;
+    if (opts.reminders !== undefined) requestBody.reminders = opts.reminders;
+    if (opts.visibility !== undefined) requestBody.visibility = opts.visibility;
+    if (opts.transparency !== undefined) requestBody.transparency = opts.transparency;
+    if (opts.guestsCanModify !== undefined) requestBody.guestsCanModify = opts.guestsCanModify;
+    if (opts.guestsCanInviteOthers !== undefined) requestBody.guestsCanInviteOthers = opts.guestsCanInviteOthers;
+    if (opts.guestsCanSeeOtherGuests !== undefined) requestBody.guestsCanSeeOtherGuests = opts.guestsCanSeeOtherGuests;
 
     if (opts.start !== undefined || opts.end !== undefined) {
       // Only fetch the existing event's timezone if we actually need it: a
@@ -366,5 +417,116 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     const now = new Date();
     const formatted = now.toLocaleString("en-US", { timeZone: timeZone || "UTC", dateStyle: "full", timeStyle: "long" });
     return textResult({ iso: now.toISOString(), formatted, timeZone: timeZone || "UTC" });
+  });
+
+  server.tool("calendar_add_meet_link", "Add a Google Meet video link to an existing event. Use this to attach conferencing to an event that was created without it (rather than recreating the event).", {
+    calendarId: z.string().describe("Calendar ID (use 'primary' for main calendar)"),
+    eventId: z.string(),
+    sendUpdates: z.enum(["all", "externalOnly", "none"]).optional(),
+  }, async ({ calendarId, eventId, sendUpdates }) => {
+    const res = await api.events.patch({
+      calendarId,
+      eventId,
+      conferenceDataVersion: 1,
+      sendUpdates,
+      requestBody: {
+        conferenceData: {
+          createRequest: {
+            requestId: `meet-${Date.now()}`,
+            conferenceSolutionKey: { type: "hangoutsMeet" },
+          },
+        },
+      },
+    });
+    const meetLink = res.data.conferenceData?.entryPoints?.find((ep) => ep.entryPointType === "video")?.uri;
+    return textResult({ eventId: res.data.id, meetLink, conferenceData: res.data.conferenceData, htmlLink: res.data.htmlLink });
+  });
+
+  server.tool("calendar_list_event_instances", "List the individual occurrences (instances) of a recurring event. Each instance has its own eventId — to edit just one occurrence, call calendar_update_event with that instance's id; to edit the whole series, use the parent (recurring) event's id; to edit this-and-following, split the series by editing the recurrence rules.", {
+    calendarId: z.string(),
+    eventId: z.string().describe("Id of the recurring (parent) event"),
+    timeMin: z.string().optional().describe("Only instances ending after this time (ISO 8601)"),
+    timeMax: z.string().optional().describe("Only instances starting before this time (ISO 8601)"),
+    timeZone: z.string().optional(),
+    maxResults: z.number().optional(),
+    pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
+  }, async ({ calendarId, eventId, timeMin, timeMax, timeZone, maxResults, pageToken }) => {
+    const res = await api.events.instances({
+      calendarId, eventId, timeMin, timeMax, timeZone,
+      maxResults: maxResults || 50,
+      pageToken,
+    });
+    return textResult({
+      instances: res.data.items?.map((e) => ({
+        id: e.id,
+        start: e.start,
+        end: e.end,
+        status: e.status,
+        summary: e.summary,
+        originalStartTime: e.originalStartTime,
+      })) || [],
+      nextPageToken: res.data.nextPageToken,
+    });
+  });
+
+  server.tool("calendar_propose_times", "Propose meeting times that work for a set of attendees: reads everyone's free/busy across a window and returns the top-ranked open slots (prefers mid-morning/mid-afternoon, avoids the lunch hour, favors earlier days). Use this to find a slot before creating an event.", {
+    attendeeEmails: z.array(z.string()).describe("Email addresses (calendar ids) whose free/busy to intersect"),
+    durationMinutes: z.number().describe("Desired meeting length in minutes"),
+    windowStart: z.string().describe("Earliest time to consider (ISO 8601)"),
+    windowEnd: z.string().describe("Latest time to consider (ISO 8601)"),
+    workingHours: z.object({
+      start: z.string().describe("Local start time HH:MM (default 09:00)"),
+      end: z.string().describe("Local end time HH:MM (default 17:30)"),
+    }).optional().describe("Working-hours window, interpreted in timeZone. Defaults to 09:00-17:30."),
+    timeZone: z.string().optional().describe("IANA timezone the working hours are in. Defaults to the primary calendar's timezone."),
+    maxResults: z.number().optional().default(5).describe("How many ranked slots to return"),
+  }, async (opts) => {
+    const windowStartMs = Date.parse(opts.windowStart);
+    const windowEndMs = Date.parse(opts.windowEnd);
+    if (Number.isNaN(windowStartMs) || Number.isNaN(windowEndMs)) {
+      throw new Error("windowStart and windowEnd must be valid ISO 8601 timestamps.");
+    }
+    const timeZone = opts.timeZone || (await getCalendarTimeZone(api, "primary")) || "UTC";
+
+    const fb = await api.freebusy.query({
+      requestBody: {
+        timeMin: opts.windowStart,
+        timeMax: opts.windowEnd,
+        timeZone,
+        items: opts.attendeeEmails.map((id) => ({ id })),
+      },
+    });
+
+    const calendars = fb.data.calendars || {};
+    const busy: Interval[] = [];
+    const errors: Array<{ calendar: string; errors: unknown }> = [];
+    for (const [id, cal] of Object.entries(calendars)) {
+      if (cal.errors?.length) errors.push({ calendar: id, errors: cal.errors });
+      for (const b of cal.busy || []) {
+        const start = b.start ? Date.parse(b.start) : NaN;
+        const end = b.end ? Date.parse(b.end) : NaN;
+        if (!Number.isNaN(start) && !Number.isNaN(end)) busy.push({ start, end });
+      }
+    }
+
+    const workingStartMinutes = opts.workingHours ? parseHhMm(opts.workingHours.start) : undefined;
+    const workingEndMinutes = opts.workingHours ? parseHhMm(opts.workingHours.end) : undefined;
+
+    const slots = proposeTimes({
+      windowStart: windowStartMs,
+      windowEnd: windowEndMs,
+      durationMinutes: opts.durationMinutes,
+      busy,
+      timeZone,
+      workingStartMinutes,
+      workingEndMinutes,
+      maxResults: opts.maxResults,
+    });
+
+    return textResult({
+      timeZone,
+      proposals: slots.map((s) => ({ start: s.start, end: s.end })),
+      ...(errors.length ? { freeBusyErrors: errors } : {}),
+    });
   });
 }
