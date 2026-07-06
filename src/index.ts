@@ -9,14 +9,19 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 // This process is one of several long-lived MCP servers driving a live
-// Claude session; a stray unhandled rejection or uncaught exception must not
-// take the whole session down. Log it to stderr (visible in Cloud Logging /
-// the MCP host's logs) and keep serving.
+// Claude session. A stray unhandled *rejection* (typically a fire-and-forget
+// Google API call) must not take the session down — log it and keep serving.
 process.on("unhandledRejection", (reason) => {
   console.error("[google-mcp] Unhandled promise rejection:", reason);
 });
+// An uncaught *exception* is different: Node's own state may be corrupt, and
+// swallowing it would also mask genuine startup failures (e.g. a missing
+// credentials file, or a top-level-await rejection from server.connect) by
+// turning them into a silent exit code 0. Log it, then exit non-zero so the
+// MCP host sees the failure and can surface/restart it.
 process.on("uncaughtException", (error) => {
   console.error("[google-mcp] Uncaught exception:", error);
+  process.exit(1);
 });
 
 // Retry 429s and 5xx errors up to 3 times across every googleapis client,
