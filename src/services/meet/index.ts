@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { google } from "googleapis";
+import { google, meet_v2 } from "googleapis";
 import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
@@ -62,8 +62,18 @@ export function registerMeetTools(server: McpServer, ctx: ServiceContext): void 
 
       const entries = await Promise.all(
         transcripts.data.transcripts.map(async (t) => {
-          const entriesRes = await meet.conferenceRecords.transcripts.entries.list({ parent: t.name! });
-          return entriesRes.data.transcriptEntries || [];
+          const all: meet_v2.Schema$TranscriptEntry[] = [];
+          let pageToken: string | undefined;
+          do {
+            const entriesRes = await meet.conferenceRecords.transcripts.entries.list({
+              parent: t.name!,
+              pageSize: 100,
+              pageToken,
+            });
+            all.push(...(entriesRes.data.transcriptEntries || []));
+            pageToken = entriesRes.data.nextPageToken || undefined;
+          } while (pageToken);
+          return all;
         })
       );
 
