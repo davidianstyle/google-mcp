@@ -3,7 +3,7 @@ import { program } from "commander";
 import { google } from "googleapis";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadAuth, loadEnvTokenAuth } from "./auth.js";
-import { resolveAuthMode } from "./cli.js";
+import { resolveAuthMode, type AuthMode } from "./cli.js";
 import { createServer, parseFamilies, ToolFamily } from "./server.js";
 import { buildRetryConfig } from "./utils/retry.js";
 import { homedir } from "node:os";
@@ -68,7 +68,7 @@ function fail(error: unknown): never {
   return program.error(`error: ${message}`);
 }
 
-let authMode;
+let authMode: AuthMode;
 let families: ToolFamily[] | undefined;
 try {
   authMode = resolveAuthMode(opts, program.getOptionValueSource("tokenDir"));
