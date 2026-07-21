@@ -1,16 +1,24 @@
 {
-  "name": "google-mcp",
-  "version": "0.1.0",
+  "name": "@davidianstyle/google-mcp",
+  "version": "0.2.0",
   "description": "Consolidated Google MCP server — Gmail, Calendar, Meet, Drive, Docs, Sheets, Slides in one process.",
   "type": "module",
   "bin": {
     "google-mcp": "./dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
     "mcp",
