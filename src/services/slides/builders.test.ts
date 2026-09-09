@@ -8,6 +8,12 @@ import {
   buildSetBackgroundRequests,
   computeAlignedTransforms,
   textContentLength,
+  chunkRequests,
+  buildTextStyleRequests,
+  buildTableHeaderRequests,
+  buildOutlineRequests,
+  buildSpeakerNotesRequests,
+  normalizeBody,
   type AlignInputElement,
 } from "./builders.js";
 
@@ -260,5 +266,134 @@ describe("textContentLength", () => {
   it("returns 0 for an empty shape (only the implicit paragraph marker)", () => {
     expect(textContentLength({ textElements: [{ paragraphMarker: {} }] })).toBe(0);
     expect(textContentLength(undefined)).toBe(0);
+  });
+});
+
+describe("chunkRequests", () => {
+  it("splits into batches of at most `size` and keeps order", () => {
+    const items = Array.from({ length: 103 }, (_, i) => i);
+    const chunks = chunkRequests(items, 50);
+    expect(chunks.map((c) => c.length)).toEqual([50, 50, 3]);
+    expect(chunks[2]).toEqual([100, 101, 102]);
+  });
+
+  it("returns no batches for an empty list", () => {
+    expect(chunkRequests([], 50)).toEqual([]);
+  });
+});
+
+describe("normalizeBody", () => {
+  it("joins array items with newlines and marks them as bullets", () => {
+    expect(normalizeBody(["a", " b ", ""])).toEqual({ text: "a\nb", bullets: true });
+  });
+  it("treats a multi-line string as bullets and a single line as a paragraph", () => {
+    expect(normalizeBody("one\ntwo")).toEqual({ text: "one\ntwo", bullets: true });
+    expect(normalizeBody("just text")).toEqual({ text: "just text", bullets: false });
+  });
+});
+
+describe("buildTextStyleRequests", () => {
+  it("returns nothing when no options are set", () => {
+    expect(buildTextStyleRequests("box", {})).toEqual([]);
+  });
+
+  it("emits bullets then one updateTextStyle with only the requested fields", () => {
+    const reqs = buildTextStyleRequests("box", { bullets: true, fontSize: 18, bold: true, fontFamily: "Roboto" });
+    expect(reqs).toEqual([
+      { createParagraphBullets: { objectId: "box", textRange: { type: "ALL" }, bulletPreset: "BULLET_DISC_CIRCLE_SQUARE" } },
+      {
+        updateTextStyle: {
+          objectId: "box",
+          textRange: { type: "ALL" },
+          style: { fontSize: { magnitude: 18, unit: "PT" }, bold: true, fontFamily: "Roboto" },
+          fields: "fontSize,bold,fontFamily",
+        },
+      },
+    ]);
+  });
+
+  it("honors bold=false explicitly", () => {
+    const [req] = buildTextStyleRequests("box", { bold: false });
+    expect(req.updateTextStyle?.style).toEqual({ bold: false });
+    expect(req.updateTextStyle?.fields).toBe("bold");
+  });
+});
+
+describe("buildTableHeaderRequests", () => {
+  it("fills row 0 across all columns and bolds each header cell", () => {
+    const reqs = buildTableHeaderRequests("tbl", 3);
+    expect(reqs).toHaveLength(4);
+    expect(reqs[0].updateTableCellProperties?.tableRange).toEqual({
+      location: { rowIndex: 0, columnIndex: 0 }, rowSpan: 1, columnSpan: 3,
+    });
+    expect(reqs[0].updateTableCellProperties?.fields).toBe("tableCellBackgroundFill.solidFill.color");
+    expect(reqs.slice(1).map((r) => r.updateTextStyle?.cellLocation)).toEqual([
+      { rowIndex: 0, columnIndex: 0 }, { rowIndex: 0, columnIndex: 1 }, { rowIndex: 0, columnIndex: 2 },
+    ]);
+    expect(reqs[1].updateTextStyle?.style).toEqual({ bold: true });
+  });
+});
+
+describe("buildOutlineRequests", () => {
+  const makeId = (prefix: string) => `${prefix}_x`;
+
+  it("defaults the first slide to TITLE and later slides to TITLE_AND_BODY, with placeholder mappings", () => {
+    const { requests, slides } = buildOutlineRequests([
+      { title: "Deck", subtitle: "Sub" },
+      { title: "Agenda", body: ["One", "Two"] },
+    ], makeId);
+
+    expect(slides.map((s) => s.layout)).toEqual(["TITLE", "TITLE_AND_BODY"]);
+    expect(slides[0].slideId).toBe("slide_1_x");
+    expect(slides[0].placeholderIds).toEqual({ title: "slide_1_x_title", subtitle: "slide_1_x_subtitle" });
+    expect(slides[1].placeholderIds).toEqual({ title: "slide_2_x_title", body: "slide_2_x_body" });
+
+    const create0 = requests[0].createSlide!;
+    expect(create0.objectId).toBe("slide_1_x");
+    expect(create0.insertionIndex).toBe(0);
+    expect(create0.slideLayoutReference).toEqual({ predefinedLayout: "TITLE" });
+    expect(create0.placeholderIdMappings).toEqual([
+      { layoutPlaceholder: { type: "CENTERED_TITLE", index: 0 }, objectId: "slide_1_x_title" },
+      { layoutPlaceholder: { type: "SUBTITLE", index: 0 }, objectId: "slide_1_x_subtitle" },
+    ]);
+
+    const types = requests.map((r) => Object.keys(r)[0]);
+    expect(types).toEqual([
+      "createSlide", "insertText", "insertText",
+      "createSlide", "insertText", "insertText", "createParagraphBullets",
+    ]);
+    const bodyInsert = requests[5].insertText!;
+    expect(bodyInsert).toEqual({ objectId: "slide_2_x_body", text: "One\nTwo", insertionIndex: 0 });
+    expect(requests[6].createParagraphBullets).toEqual({
+      objectId: "slide_2_x_body", textRange: { type: "ALL" }, bulletPreset: "BULLET_DISC_CIRCLE_SQUARE",
+    });
+  });
+
+  it("does not bullet a single-line body string", () => {
+    const { requests } = buildOutlineRequests([{ layout: "TITLE_AND_BODY", title: "T", body: "Just a sentence." }], makeId);
+    expect(requests.some((r) => r.createParagraphBullets)).toBe(false);
+  });
+
+  it("skips fields the layout has no placeholder for and reports them", () => {
+    const { requests, slides } = buildOutlineRequests([{ layout: "TITLE_ONLY", title: "T", body: ["a"], subtitle: "s" }], makeId);
+    expect(slides[0].skipped).toEqual(["subtitle", "body"]);
+    expect(slides[0].placeholderIds).toEqual({ title: "slide_1_x_title" });
+    expect(requests[0].createSlide?.placeholderIdMappings).toHaveLength(1);
+  });
+
+  it("carries notes through without emitting requests for them", () => {
+    const { requests, slides } = buildOutlineRequests([{ layout: "BLANK", notes: "say hi" }], makeId);
+    expect(slides[0].notes).toBe("say hi");
+    expect(requests).toHaveLength(1);
+    expect(requests[0].createSlide?.placeholderIdMappings).toBeUndefined();
+  });
+});
+
+describe("buildSpeakerNotesRequests", () => {
+  it("emits one insertText per non-empty note", () => {
+    expect(buildSpeakerNotesRequests([
+      { speakerNotesObjectId: "n1", notes: "hello" },
+      { speakerNotesObjectId: "n2", notes: "" },
+    ])).toEqual([{ insertText: { objectId: "n1", text: "hello", insertionIndex: 0 } }]);
   });
 });

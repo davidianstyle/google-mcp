@@ -17,6 +17,12 @@ import {
   buildSetBackgroundRequests,
   computeAlignedTransforms,
   textContentLength,
+  chunkRequests,
+  buildTextStyleRequests,
+  buildTableHeaderRequests,
+  buildOutlineRequests,
+  buildSpeakerNotesRequests,
+  type OutlineSlide,
   type PlaceholderSpec,
   type AlignInputElement,
   type BackgroundFill,
@@ -64,15 +70,73 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
   const api = google.slides({ version: "v1", auth: ctx.auth });
   const driveApi = google.drive({ version: "v3", auth: ctx.auth });
 
-  server.tool("slides_create_presentation", "Create a new Google Slides presentation", {
+  server.tool("slides_create_presentation", "Create a new Google Slides presentation. Preferred way to build a deck: pass a `slides` outline and every slide is created from a real theme layout with filled placeholders and bullets; avoid BLANK slides with floating text boxes. Each outline item: { layout? (default TITLE for the first slide, TITLE_AND_BODY after), title?, subtitle?, body? (string = paragraph; string[] or a multi-line string = one bullet per item/line), notes? (speaker notes) }. Layouts without a matching placeholder skip that field (reported in the response). Without `slides` an empty deck with the default first slide is created.", {
     title: z.string(),
-  }, async ({ title }) => {
+    slides: z.array(z.object({
+      layout: z.enum(PREDEFINED_LAYOUTS).optional().describe("Theme layout. Placeholders per layout: TITLE=title+subtitle, TITLE_AND_BODY/ONE_COLUMN_TEXT/BIG_NUMBER=title+body, SECTION_TITLE_AND_DESCRIPTION=title+subtitle, TITLE_ONLY/SECTION_HEADER/MAIN_POINT=title, CAPTION_ONLY=body"),
+      title: z.string().optional(),
+      subtitle: z.string().optional(),
+      body: z.union([z.string(), z.array(z.string())]).optional().describe("Body text. An array (or a string with newlines) becomes a bulleted list."),
+      notes: z.string().optional().describe("Speaker notes for the slide"),
+    })).optional().describe("Deck outline; one item per slide, in order."),
+  }, async ({ title, slides }) => {
     const res = await api.presentations.create({ requestBody: { title } });
+    const presentationId = res.data.presentationId!;
+    const url = `https://docs.google.com/presentation/d/${presentationId}/edit`;
+    if (!slides?.length) {
+      return textResult({
+        presentationId,
+        title: res.data.title,
+        url,
+        slides: res.data.slides?.map((s) => s.objectId),
+      });
+    }
+
+    // New decks come with one default slide; drop it so the outline is the whole deck.
+    const defaultSlideIds = (res.data.slides ?? []).map((s) => s.objectId).filter((id): id is string => !!id);
+    const { requests, slides: built } = buildOutlineRequests(slides as OutlineSlide[], uniqueId);
+    const all: slides_v1.Schema$Request[] = [
+      ...requests,
+      ...defaultSlideIds.map((objectId) => ({ deleteObject: { objectId } })),
+    ];
+    for (const batch of chunkRequests(all, 50)) {
+      await api.presentations.batchUpdate({ presentationId, requestBody: { requests: batch } });
+    }
+
+    // Speaker notes shapes only exist after the slides do; resolve them now.
+    const wantNotes = built.filter((b) => b.notes);
+    let notesApplied = 0;
+    if (wantNotes.length) {
+      const pres = await api.presentations.get({
+        presentationId,
+        fields: "slides(objectId,slideProperties(notesPage(notesProperties(speakerNotesObjectId))))",
+      });
+      const notesIdBySlide = new Map<string, string>();
+      for (const s of pres.data.slides ?? []) {
+        const id = s.slideProperties?.notesPage?.notesProperties?.speakerNotesObjectId;
+        if (s.objectId && id) notesIdBySlide.set(s.objectId, id);
+      }
+      const targets = wantNotes.flatMap((b) => {
+        const speakerNotesObjectId = notesIdBySlide.get(b.slideId);
+        return speakerNotesObjectId ? [{ speakerNotesObjectId, notes: b.notes! }] : [];
+      });
+      for (const batch of chunkRequests(buildSpeakerNotesRequests(targets), 50)) {
+        await api.presentations.batchUpdate({ presentationId, requestBody: { requests: batch } });
+      }
+      notesApplied = targets.length;
+    }
+
     return textResult({
-      presentationId: res.data.presentationId,
+      presentationId,
       title: res.data.title,
-      url: `https://docs.google.com/presentation/d/${res.data.presentationId}/edit`,
-      slides: res.data.slides?.map((s) => s.objectId),
+      url,
+      slides: built.map((b) => ({
+        slideId: b.slideId,
+        layout: b.layout,
+        placeholderIds: b.placeholderIds,
+        ...(b.skipped.length ? { skippedFields: b.skipped } : {}),
+      })),
+      ...(wantNotes.length ? { speakerNotesApplied: notesApplied } : {}),
     });
   });
 
@@ -165,15 +229,19 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     return textResult({ success: true });
   });
 
-  server.tool("slides_add_text", "Add a text box to a slide", {
+  server.tool("slides_add_text", "Add a floating text box to a slide. The text is PLAIN (theme body font, no bullets) unless you set bullets / fontSize / bold / fontFamily, which are applied to the whole box in the same call. Prefer real layouts + slides_fill_placeholder (or a `slides` outline in slides_create_presentation) so text inherits the theme; use this only for extra callouts.", {
     presentationId: z.string(),
     slideObjectId: z.string(),
     text: z.string(),
-    x: z.number().optional().default(100).describe("X position in EMU or points"),
+    x: z.number().optional().default(100).describe("X position in points"),
     y: z.number().optional().default(100),
     width: z.number().optional().default(400),
     height: z.number().optional().default(50),
-  }, async ({ presentationId, slideObjectId, text, x, y, width, height }) => {
+    bullets: z.boolean().optional().describe("Render each line as a bullet (BULLET_DISC_CIRCLE_SQUARE)"),
+    fontSize: z.number().optional().describe("Font size in points"),
+    bold: z.boolean().optional(),
+    fontFamily: z.string().optional().describe("Font family name, e.g. 'Roboto'"),
+  }, async ({ presentationId, slideObjectId, text, x, y, width, height, bullets, fontSize, bold, fontFamily }) => {
     const boxId = uniqueId("textbox");
     const emu = (pts: number) => pts * 12700;
     await api.presentations.batchUpdate({
@@ -194,6 +262,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
           {
             insertText: { objectId: boxId, text, insertionIndex: 0 },
           },
+          ...buildTextStyleRequests(boxId, { bullets, fontSize, bold, fontFamily }),
         ],
       },
     });
@@ -635,7 +704,7 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     return textResult({ success: true, slidesUpdated: slideIds.length });
   });
 
-  server.tool("slides_add_table", "Add a table to a slide, optionally pre-filled with data. Provide `data` as a 2D array of cell strings; rows/columns are inferred from it (or pass rows/columns for an empty table). Good for comparisons, schedules, and structured content.", {
+  server.tool("slides_add_table", "Add a table to a slide, optionally pre-filled with data. Provide `data` as a 2D array of cell strings; rows/columns are inferred from it (or pass rows/columns for an empty table). When data has 2+ rows the first row is styled as a header (bold, light fill) unless header_row=false. Good for comparisons, schedules, and structured content.", {
     presentationId: z.string(),
     slideObjectId: z.string(),
     rows: z.number().optional().describe("Row count (inferred from data if omitted)"),
@@ -645,7 +714,8 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
     y: z.number().optional().default(50).describe("Y position in points"),
     width: z.number().optional().default(400).describe("Width in points"),
     height: z.number().optional().default(200).describe("Height in points"),
-  }, async ({ presentationId, slideObjectId, rows, columns, data, x, y, width, height }) => {
+    header_row: z.boolean().optional().describe("Style row 0 as a header (bold + light fill). Defaults to true when data has 2+ rows."),
+  }, async ({ presentationId, slideObjectId, rows, columns, data, x, y, width, height, header_row }) => {
     const numRows = rows ?? data?.length ?? 1;
     const numCols = columns ?? data?.[0]?.length ?? 1;
     const tableId = uniqueId("table");
@@ -675,8 +745,12 @@ export function registerSlidesTools(server: McpServer, ctx: ServiceContext): voi
         }
       }
     }
-    await api.presentations.batchUpdate({ presentationId, requestBody: { requests } });
-    return textResult({ tableId, rows: numRows, columns: numCols });
+    const styleHeader = header_row ?? ((data?.length ?? 0) >= 2);
+    if (styleHeader && numRows >= 1) requests.push(...buildTableHeaderRequests(tableId, numCols));
+    for (const batch of chunkRequests(requests, 50)) {
+      await api.presentations.batchUpdate({ presentationId, requestBody: { requests: batch } });
+    }
+    return textResult({ tableId, rows: numRows, columns: numCols, headerRow: styleHeader });
   });
 
   server.tool("slides_set_table_cell_text", "Set the text of one cell in an existing table (by table object ID and 0-based row/column). Clears the cell first by default so this is a true 'set'.", {

@@ -379,3 +379,197 @@ export function textContentLength(text: slides_v1.Schema$TextContent | undefined
   }
   return len;
 }
+
+// ---------------------------------------------------------------------------
+// Native authoring: outline -> createSlide + placeholder fills, text-box
+// styling, table header styling, and request chunking.
+// ---------------------------------------------------------------------------
+
+/** Split a request list into batches of at most `size` (Slides batchUpdate practical cap). */
+export function chunkRequests<T>(requests: T[], size = 50): T[][] {
+  if (size <= 0) throw new Error("chunk size must be positive");
+  const out: T[][] = [];
+  for (let i = 0; i < requests.length; i += size) out.push(requests.slice(i, i + size));
+  return out;
+}
+
+export interface TextBoxStyleOptions {
+  bullets?: boolean;
+  fontSize?: number;
+  bold?: boolean;
+  fontFamily?: string;
+}
+
+/**
+ * Follow-up requests that style ALL text in a shape: optional bullets plus an
+ * updateTextStyle for any of fontSize/bold/fontFamily that were provided.
+ * Returns [] when nothing was requested so callers can spread it freely.
+ */
+export function buildTextStyleRequests(objectId: string, opts: TextBoxStyleOptions): slides_v1.Schema$Request[] {
+  const requests: slides_v1.Schema$Request[] = [];
+  if (opts.bullets) {
+    requests.push({
+      createParagraphBullets: { objectId, textRange: { type: "ALL" }, bulletPreset: "BULLET_DISC_CIRCLE_SQUARE" },
+    });
+  }
+  const style: slides_v1.Schema$TextStyle = {};
+  const fields: string[] = [];
+  if (opts.fontSize !== undefined) { style.fontSize = { magnitude: opts.fontSize, unit: "PT" }; fields.push("fontSize"); }
+  if (opts.bold !== undefined) { style.bold = opts.bold; fields.push("bold"); }
+  if (opts.fontFamily) { style.fontFamily = opts.fontFamily; fields.push("fontFamily"); }
+  if (fields.length) {
+    requests.push({ updateTextStyle: { objectId, textRange: { type: "ALL" }, style, fields: fields.join(",") } });
+  }
+  return requests;
+}
+
+/**
+ * Bold + light-grey fill for row 0 of a table. Cell text styling is per-cell
+ * (updateTextStyle needs a cellLocation), so one request per column; the fill
+ * is one updateTableCellProperties over the whole row via tableRange.
+ */
+export function buildTableHeaderRequests(tableId: string, columns: number): slides_v1.Schema$Request[] {
+  const requests: slides_v1.Schema$Request[] = [{
+    updateTableCellProperties: {
+      objectId: tableId,
+      tableRange: { location: { rowIndex: 0, columnIndex: 0 }, rowSpan: 1, columnSpan: columns },
+      tableCellProperties: {
+        tableCellBackgroundFill: { solidFill: { color: { rgbColor: { red: 0.93, green: 0.93, blue: 0.93 } } } },
+      },
+      fields: "tableCellBackgroundFill.solidFill.color",
+    },
+  }];
+  for (let c = 0; c < columns; c++) {
+    requests.push({
+      updateTextStyle: {
+        objectId: tableId,
+        cellLocation: { rowIndex: 0, columnIndex: c },
+        textRange: { type: "ALL" },
+        style: { bold: true },
+        fields: "bold",
+      },
+    });
+  }
+  return requests;
+}
+
+export interface OutlineSlide {
+  layout?: string;
+  title?: string;
+  subtitle?: string;
+  /** Array = one bullet per item; a string containing newlines = one bullet per line; plain string = a paragraph. */
+  body?: string | string[];
+  notes?: string;
+}
+
+/**
+ * Placeholder types present on each predefined layout of the default Slides
+ * theme. `placeholderIdMappings` errors if it names a placeholder the layout
+ * lacks, so fills are routed only to placeholders that exist; anything with no
+ * home is reported in `skipped`.
+ */
+export const LAYOUT_PLACEHOLDERS: Record<string, { title?: string; subtitle?: string; body?: string }> = {
+  BLANK: {},
+  CAPTION_ONLY: { body: "BODY" },
+  TITLE: { title: "CENTERED_TITLE", subtitle: "SUBTITLE" },
+  TITLE_AND_BODY: { title: "TITLE", body: "BODY" },
+  TITLE_AND_TWO_COLUMNS: { title: "TITLE", body: "BODY" },
+  TITLE_ONLY: { title: "TITLE" },
+  SECTION_HEADER: { title: "TITLE" },
+  SECTION_TITLE_AND_DESCRIPTION: { title: "TITLE", subtitle: "SUBTITLE" },
+  ONE_COLUMN_TEXT: { title: "TITLE", body: "BODY" },
+  MAIN_POINT: { title: "TITLE" },
+  BIG_NUMBER: { title: "TITLE", body: "BODY" },
+};
+
+/** Normalize a body value to the text to insert and whether it should be bulleted. */
+export function normalizeBody(body: string | string[]): { text: string; bullets: boolean } {
+  if (Array.isArray(body)) {
+    const items = body.map((s) => s.trim()).filter(Boolean);
+    return { text: items.join("\n"), bullets: items.length > 0 };
+  }
+  const lines = body.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  if (lines.length > 1) return { text: lines.join("\n"), bullets: true };
+  return { text: lines[0] ?? "", bullets: false };
+}
+
+export interface OutlineSlideResult {
+  slideId: string;
+  layout: string;
+  placeholderIds: { title?: string; subtitle?: string; body?: string };
+  notes?: string;
+  /** Outline fields that had no placeholder on the chosen layout. */
+  skipped: string[];
+}
+
+export interface OutlineRequests {
+  requests: slides_v1.Schema$Request[];
+  slides: OutlineSlideResult[];
+}
+
+/**
+ * Turns a deck outline into createSlide + insertText (+ createParagraphBullets)
+ * requests. Every slide comes from a real layout with placeholderIdMappings so
+ * text lands in themed placeholders. Speaker notes are NOT emitted here: the
+ * notes shape ID only exists after the slide is created (see
+ * buildSpeakerNotesRequests). `makeId` lets tests use deterministic IDs.
+ */
+export function buildOutlineRequests(
+  outline: OutlineSlide[],
+  makeId: (prefix: string) => string = defaultMakeId,
+): OutlineRequests {
+  const requests: slides_v1.Schema$Request[] = [];
+  const slides: OutlineSlideResult[] = [];
+
+  outline.forEach((item, i) => {
+    const layout = item.layout ?? (i === 0 ? "TITLE" : "TITLE_AND_BODY");
+    const available = LAYOUT_PLACEHOLDERS[layout] ?? {};
+    const slideId = makeId(`slide_${i + 1}`);
+    const placeholderIds: OutlineSlideResult["placeholderIds"] = {};
+    const placeholders: PlaceholderSpec[] = [];
+    const skipped: string[] = [];
+    const fills: Array<{ objectId: string; text: string; bullets: boolean }> = [];
+
+    const wire = (field: "title" | "subtitle" | "body", value: string | string[] | undefined) => {
+      if (value === undefined) return;
+      const norm = field === "body" ? normalizeBody(value) : { text: String(value), bullets: false };
+      if (!norm.text) return;
+      const type = available[field];
+      if (!type) { skipped.push(field); return; }
+      const objectId = `${slideId}_${field}`; // stays well under the 50-char object ID cap
+      placeholderIds[field] = objectId;
+      placeholders.push({ type, index: 0, objectId });
+      fills.push({ objectId, ...norm });
+    };
+    wire("title", item.title);
+    wire("subtitle", item.subtitle);
+    wire("body", item.body);
+
+    requests.push(buildCreateSlideRequest({ slideObjectId: slideId, predefinedLayout: layout, insertionIndex: i, placeholders }));
+    for (const f of fills) {
+      requests.push({ insertText: { objectId: f.objectId, text: f.text, insertionIndex: 0 } });
+      if (f.bullets) {
+        requests.push({
+          createParagraphBullets: { objectId: f.objectId, textRange: { type: "ALL" }, bulletPreset: "BULLET_DISC_CIRCLE_SQUARE" },
+        });
+      }
+    }
+
+    slides.push({ slideId, layout, placeholderIds, notes: item.notes || undefined, skipped });
+  });
+
+  return { requests, slides };
+}
+
+/** insertText requests for freshly created (empty) speaker-notes shapes. */
+export function buildSpeakerNotesRequests(targets: Array<{ speakerNotesObjectId: string; notes: string }>): slides_v1.Schema$Request[] {
+  return targets
+    .filter((t) => t.notes)
+    .map((t) => ({ insertText: { objectId: t.speakerNotesObjectId, text: t.notes, insertionIndex: 0 } }));
+}
+
+let idCounter = 0;
+function defaultMakeId(prefix: string): string {
+  idCounter += 1;
+  return `${prefix}_${Date.now().toString(36)}_${idCounter}`;
+}

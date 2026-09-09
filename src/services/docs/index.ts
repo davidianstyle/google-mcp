@@ -3,7 +3,7 @@ import { google, docs_v1, drive_v3 } from "googleapis";
 import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
-import { concatMarkdownForAppend } from "./markdown.js";
+import { concatMarkdownForAppend, MARKDOWN_SUPPORT_NOTE } from "./markdown.js";
 
 function extractPlainText(body: docs_v1.Schema$Body | undefined): string {
   if (!body?.content) return "";
@@ -184,10 +184,24 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     return textResult(`${header}\n${shown}`);
   });
 
-  server.tool("docs_create_document", "Create a new Google Document", {
+  server.tool("docs_create_document", `Create a new Google Document. Passing markdown is the PREFERRED way to create a formatted doc: the whole document is created in one call with native Docs formatting via Drive's markdown converter, so there is no need to follow up with docs_insert_text / docs_apply_* calls. Without markdown an empty document is created. ${MARKDOWN_SUPPORT_NOTE}`, {
     title: z.string(),
     parentFolderId: z.string().optional(),
-  }, async ({ title, parentFolderId }) => {
+    markdown: z.string().optional().describe("Initial document content as markdown, converted to native Docs formatting on creation."),
+  }, async ({ title, parentFolderId, markdown }) => {
+    if (markdown !== undefined) {
+      const created = await driveApi.files.create({
+        supportsAllDrives: true,
+        requestBody: {
+          name: title,
+          mimeType: "application/vnd.google-apps.document",
+          parents: parentFolderId ? [parentFolderId] : undefined,
+        },
+        media: { mimeType: "text/markdown", body: markdown },
+        fields: "id,name",
+      });
+      return textResult({ documentId: created.data.id, title: created.data.name, url: `https://docs.google.com/document/d/${created.data.id}/edit` });
+    }
     const doc = await docsApi.documents.create({ requestBody: { title } });
     if (parentFolderId && doc.data.documentId) {
       await driveApi.files.update({ fileId: doc.data.documentId, addParents: parentFolderId, fields: "id" });
@@ -245,7 +259,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     return textResult({ success: true, appendedAt: endIndex });
   });
 
-  server.tool("docs_append_markdown", "Append markdown to the end of a document, rendered as NATIVE Google Docs content (real headings, bold/italic, links, lists, tables) via Drive's markdown converter. Works by exporting the current doc to markdown, concatenating your markdown, and re-importing the whole thing. CAVEAT: because this rewrites the entire document, comments, suggestions, and named anchors/bookmarks in the existing content are NOT preserved. For surgical edits that keep those, use docs_insert_text / docs_apply_* instead.", {
+  server.tool("docs_append_markdown", `Append markdown to the end of a document, rendered as NATIVE Google Docs content via Drive's markdown converter. Works by exporting the current doc to markdown, concatenating your markdown, and re-importing the whole thing. CAVEAT: because this rewrites the entire document, comments, suggestions, and named anchors/bookmarks in the existing content are NOT preserved. For surgical edits that keep those, use docs_insert_text / docs_apply_* instead. ${MARKDOWN_SUPPORT_NOTE}`, {
     documentId: z.string(),
     markdown: z.string(),
   }, async ({ documentId, markdown }) => {
@@ -280,7 +294,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     return textResult({ success: true });
   });
 
-  server.tool("docs_replace_with_markdown", "Replace the ENTIRE document with markdown, rendered as native Google Docs content (real headings, bold/italic, links, lists, tables) via Drive's markdown converter — not plain text. This overwrites all existing content. CAVEAT: because it re-imports the whole file, existing comments, suggestions, and named anchors/bookmarks are NOT preserved. Best for generating a document from scratch or wholesale rewrites; use docs_insert_text / docs_modify_text / docs_apply_* for edits that must keep those.", {
+  server.tool("docs_replace_with_markdown", `Replace the ENTIRE document with markdown, rendered as native Google Docs content via Drive's markdown converter — not plain text. This overwrites all existing content. CAVEAT: because it re-imports the whole file, existing comments, suggestions, and named anchors/bookmarks are NOT preserved. Best for wholesale rewrites (for a brand-new doc, use docs_create_document with markdown); use docs_insert_text / docs_modify_text / docs_apply_* for edits that must keep those. ${MARKDOWN_SUPPORT_NOTE}`, {
     documentId: z.string(),
     markdown: z.string(),
   }, async ({ documentId, markdown }) => {
@@ -563,7 +577,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     startIndex: z.number(),
     endIndex: z.number(),
-    namedStyleType: z.enum(["NORMAL_TEXT", "HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6"]).optional(),
+    namedStyleType: z.enum(["NORMAL_TEXT", "TITLE", "SUBTITLE", "HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6"]).optional(),
     alignment: z.enum(["START", "CENTER", "END", "JUSTIFIED"]).optional(),
     lineSpacing: z.number().optional().describe("Line spacing (100 = single, 200 = double)"),
     spaceAbove: z.number().optional().describe("Space above in points"),

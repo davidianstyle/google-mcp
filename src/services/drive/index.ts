@@ -26,6 +26,37 @@ const UPLOAD_EXT_TO_MIME: Record<string, string> = {
   ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 };
 
+const GOOGLE_APPS_PREFIX = "application/vnd.google-apps.";
+
+export type ConvertTarget = "document" | "spreadsheet" | "presentation";
+
+/**
+ * Decide the two MIME types for a Drive upload:
+ *  - mediaMimeType: the real type of the bytes being sent (media.mimeType)
+ *  - targetMimeType: the Google-native type Drive should convert to
+ *    (requestBody.mimeType), or undefined for a plain upload.
+ *
+ * A caller passing mime_type='application/vnd.google-apps.*' is treated as
+ * asking for conversion: that value moves to the target and the media type is
+ * guessed from the extension (sending a google-apps type as media would fail).
+ */
+export function resolveUploadMimeTypes(localPath: string, mimeType?: string, convertTo?: ConvertTarget): {
+  mediaMimeType: string;
+  targetMimeType?: string;
+} {
+  const guessed = UPLOAD_EXT_TO_MIME[extname(localPath).toLowerCase()] || "application/octet-stream";
+  let targetMimeType: string | undefined = convertTo ? `${GOOGLE_APPS_PREFIX}${convertTo}` : undefined;
+  let mediaMimeType = guessed;
+  if (mimeType) {
+    if (mimeType.startsWith(GOOGLE_APPS_PREFIX)) {
+      targetMimeType = targetMimeType ?? mimeType;
+    } else {
+      mediaMimeType = mimeType;
+    }
+  }
+  return { mediaMimeType, targetMimeType };
+}
+
 // Hard cap for inline (returnContent=true) downloads to keep tool responses
 // from blowing past MCP/LLM context budgets and to avoid OOM. Callers that
 // need larger payloads should use the default disk mode.
@@ -429,12 +460,13 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     return textResult({ ...meta.data, childCount: children.data.files?.length || 0 });
   });
 
-  server.tool("drive_upload_file", "Upload a local file into Google Drive. Reads from local_path (must exist) and creates a new Drive file. Defaults: name = the file's basename, mime_type = guessed from the extension, destination = My Drive root (pass folder_id to place it in a folder). Large files are uploaded resumably by the SDK.", {
+  server.tool("drive_upload_file", "Upload a local file into Google Drive. Reads from local_path (must exist) and creates a new Drive file. Defaults: name = the file's basename, mime_type = guessed from the extension, destination = My Drive root (pass folder_id to place it in a folder). Large files are uploaded resumably by the SDK. Pass convert_to to have Drive convert the upload into a native, editable Google file: .docx/.md/.html → document, .pptx → presentation, .xlsx/.csv → spreadsheet. Markdown (text/markdown) converts to a Google Doc with headings, bold/italic, links, lists and tables preserved. Passing mime_type='application/vnd.google-apps.<type>' is treated the same as convert_to.", {
     local_path: z.string().describe("Path to the local file to upload"),
     folder_id: z.string().optional().describe("Destination folder ID. Omit for My Drive root."),
     name: z.string().optional().describe("Name for the Drive file. Defaults to the local file's basename."),
-    mime_type: z.string().optional().describe("MIME type. Guessed from the file extension if omitted."),
-  }, async ({ local_path, folder_id, name, mime_type }) => {
+    mime_type: z.string().optional().describe("MIME type of the local file. Guessed from the file extension if omitted. A google-apps type (application/vnd.google-apps.*) is treated as convert_to."),
+    convert_to: z.enum(["document", "spreadsheet", "presentation"]).optional().describe("Convert on upload into a native Google Doc/Sheet/Slides file (server-side Drive conversion). The result is editable in Google Docs/Sheets/Slides and by the docs_*/sheets_*/slides_* tools."),
+  }, async ({ local_path, folder_id, name, mime_type, convert_to }) => {
     // Fail fast with a clean error if the path doesn't exist or isn't a file,
     // instead of letting a lazy read stream reject opaquely mid-upload.
     let fileStat;
@@ -448,16 +480,17 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     }
 
     const fileName = name || basename(local_path);
-    const mimeType = mime_type || UPLOAD_EXT_TO_MIME[extname(local_path).toLowerCase()] || "application/octet-stream";
+    const { mediaMimeType, targetMimeType } = resolveUploadMimeTypes(local_path, mime_type, convert_to);
 
     const res = await api.files.create({
       supportsAllDrives: true,
       requestBody: {
         name: fileName,
         parents: folder_id ? [folder_id] : undefined,
+        mimeType: targetMimeType,
       },
       media: {
-        mimeType,
+        mimeType: mediaMimeType,
         body: createReadStream(local_path),
       },
       fields: "id,name,mimeType,size,parents,webViewLink",
