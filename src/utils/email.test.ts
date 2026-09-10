@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildRawEmail,
+  textToHtml,
   buildReplyHeaders,
   capTextLength,
   formatMessage,
@@ -265,5 +266,27 @@ describe("formatMessage body capping", () => {
       },
     };
     expect(formatMessage(msg).body).toBe("short body");
+  });
+});
+
+describe("textToHtml / default HTML part", () => {
+  it("converts paragraphs, bullets and numbered lists", () => {
+    const html = textToHtml("Hi there,\n\nPara one.\n\n- a\n- b\n\n1. x\n2. y\n\nBye\nDavid");
+    expect(html).toContain("<p>Hi there,</p>");
+    expect(html).toContain("<ul><li>a</li><li>b</li></ul>");
+    expect(html).toContain("<ol><li>x</li><li>y</li></ol>");
+    expect(html).toContain("<p>Bye<br>David</p>");
+  });
+  it("escapes html", () => {
+    expect(textToHtml("a < b & c")).toContain("a &lt; b &amp; c");
+  });
+  it("buildRawEmail multipart/alternative auto-generates an HTML part", () => {
+    const raw = buildRawEmail({ to: ["a@b.com"], subject: "s", body: "hello\n\n- one", mimeType: "multipart/alternative" });
+    expect(raw).toContain("multipart/alternative");
+    expect(raw).toContain("text/html");
+  });
+  it("respects explicit text/plain", () => {
+    const raw = buildRawEmail({ to: ["a@b.com"], subject: "s", body: "hello", mimeType: "text/plain" });
+    expect(raw).not.toContain("text/html");
   });
 });

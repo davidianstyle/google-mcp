@@ -93,6 +93,37 @@ function wrapBase64(base64: string): string {
  * text (which would otherwise violate RFC 5322's 998-octet line limit)
  * become short, safe base64 lines instead.
  */
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/**
+ * Converts a plain-text email body into simple HTML so Gmail never treats the
+ * message as text-only. Gmail's compose editor re-saves text/plain-only drafts
+ * with hard wraps at ~70 columns, and plain-text sends render as monospace
+ * blocks in some clients; an HTML part keeps paragraphs flowing as written.
+ *
+ * Rules: blank lines separate blocks; a block whose lines all start with
+ * "- " / "* " / "• " becomes <ul>; one whose lines all start with "1. " /
+ * "1) " becomes <ol>; anything else becomes <p> with single newlines as <br>.
+ */
+export function textToHtml(text: string): string {
+  const blocks = text.replace(/\r\n/g, "\n").trim().split(/\n{2,}/);
+  const html = blocks.map((block) => {
+    const lines = block.split("\n");
+    const ul = /^\s*[-*•]\s+/;
+    const ol = /^\s*\d+[.)]\s+/;
+    if (lines.every((l) => ul.test(l))) {
+      return `<ul>${lines.map((l) => `<li>${escapeHtml(l.replace(ul, ""))}</li>`).join("")}</ul>`;
+    }
+    if (lines.every((l) => ol.test(l))) {
+      return `<ol>${lines.map((l) => `<li>${escapeHtml(l.replace(ol, ""))}</li>`).join("")}</ol>`;
+    }
+    return `<p>${lines.map(escapeHtml).join("<br>")}</p>`;
+  });
+  return `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5">${html.join("")}</div>`;
+}
+
 function encodeBodyBase64(text: string): string {
   return wrapBase64(Buffer.from(text, "utf-8").toString("base64"));
 }
@@ -113,6 +144,12 @@ export interface EmailAttachment {
  * attachments are present).
  */
 function renderBodyPart(opts: { body: string; htmlBody?: string; mimeType?: string }): string {
+  // The Gmail tools default mimeType to multipart/alternative; when no htmlBody
+  // is supplied, auto-generate one so Gmail never stores the message as
+  // text-only (see textToHtml). An undefined/text-plain mimeType stays text-only.
+  if (!opts.htmlBody && opts.mimeType === "multipart/alternative") {
+    opts = { ...opts, htmlBody: textToHtml(opts.body) };
+  }
   if (opts.htmlBody && opts.mimeType === "multipart/alternative") {
     const boundary = `alt_${Date.now()}`;
     const parts = [
