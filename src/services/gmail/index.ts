@@ -7,6 +7,7 @@ import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
 import {
   buildRawEmail,
+  buildReferencesChain,
   buildReplyHeaders,
   decodeBase64UrlToBuffer,
   encodeBase64Url,
@@ -15,9 +16,21 @@ import {
   extractBody,
   formatMessage,
   getHeader,
+  htmlToText,
   type EmailAttachment,
+  type InlineImagePart,
   type OriginalMessageHeaders,
 } from "../../utils/email.js";
+import {
+  buildForwardRawEmail,
+  checkForwardRawSize,
+  estimateForwardSize,
+  largestAttachments,
+  parseForwardContent,
+  selectForwardAttachments,
+  type ForwardAttachment,
+  type ForwardHeaderFields,
+} from "../../utils/forward.js";
 import { withConcurrencyLimit } from "../../utils/concurrency.js";
 import { mapGoogleError, isInsufficientScopeError, describeMissingScopeError } from "../../utils/errors.js";
 import { ensureCacheInitialized, maybePeriodicSweep, cachePath } from "../../utils/download-cache.js";
@@ -74,6 +87,53 @@ async function resolveAttachments(attachments: AttachmentInput[] | undefined): P
       return { filename, mimeType, contentBase64 };
     })
   );
+}
+
+/**
+ * Resolves one forward leaf's bytes: already-inline body.data wins (no
+ * network call needed); otherwise fetches it via attachments.get. Shared by
+ * gmail_forward_email's attachment and inline-image resolution below.
+ */
+async function resolveForwardBytes(api: gmail_v1.Gmail, messageId: string, item: ForwardAttachment): Promise<string> {
+  if (item.contentBase64) return item.contentBase64;
+  if (!item.attachmentId) return "";
+  const res = await api.users.messages.attachments.get({ userId: "me", messageId, id: item.attachmentId });
+  return decodeBase64UrlToBuffer(res.data.data || "").toString("base64");
+}
+
+/**
+ * Resolves both the inline-image and regular-attachment byte sets for a
+ * forward in one pass, fetching at most 5 attachments concurrently (the same
+ * limit used elsewhere in this file) rather than the uncapped parallelism of
+ * Promise.all. A rejection from any single fetch fails the whole forward —
+ * the original Promise.all-based resolvers had the same fail-fast behavior,
+ * and a forward missing one of its attachments isn't a forward worth sending
+ * silently.
+ */
+async function resolveForwardLeaves(
+  api: gmail_v1.Gmail,
+  messageId: string,
+  inlineItems: ForwardAttachment[],
+  attachmentItems: ForwardAttachment[]
+): Promise<{ inlineImages: InlineImagePart[]; attachments: EmailAttachment[] }> {
+  const combined = [...inlineItems, ...attachmentItems];
+  const settled = await withConcurrencyLimit(combined, 5, (item) => resolveForwardBytes(api, messageId, item));
+  const failure = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
+  if (failure) throw failure.reason;
+  const bytes = (settled as PromiseFulfilledResult<string>[]).map((r) => r.value);
+
+  const inlineImages = inlineItems.map((item, i) => ({
+    filename: item.filename,
+    mimeType: item.mimeType,
+    contentBase64: bytes[i],
+    contentId: item.contentId || "",
+  }));
+  const attachments = attachmentItems.map((item, i) => ({
+    filename: item.filename,
+    mimeType: item.mimeType,
+    contentBase64: bytes[inlineItems.length + i],
+  }));
+  return { inlineImages, attachments };
 }
 
 /**
@@ -248,6 +308,108 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       requestBody: { raw, threadId: original.data.threadId || undefined },
     });
     return textResult({ id: res.data.id, threadId: res.data.threadId, to: reply.to, cc, subject: reply.subject });
+  });
+
+  server.tool("gmail_forward_email", "Forward an existing email, mirroring Gmail's web Forward button: preserves the original text/plain and text/html bodies, inline (cid:) images, and attachments, and keeps the forward in the original message's thread. Use this instead of reading the body yourself and re-sending it.", {
+    messageId: z.string().describe("Gmail API id of the message to forward (e.g. from gmail_search_emails)"),
+    to: z.array(z.string()).describe("Recipient email addresses"),
+    cc: z.array(z.string()).optional().describe("CC recipients"),
+    bcc: z.array(z.string()).optional().describe("BCC recipients"),
+    note: z.string().optional().describe("Plain-text note to add above the forwarded message, your own words introducing it"),
+    includeAttachments: z.boolean().optional().default(true).describe("Carry the original's regular attachments along. Inline (cid:) images are always kept regardless — they're part of the rendered body, not an optional extra."),
+    includeSignature: z.boolean().optional().default(true).describe("Insert the default send-as signature (see gmail_get_signature) after the note and before the forwarded-message block, as Gmail's web UI does."),
+    asDraft: z.boolean().optional().default(false).describe("Create a draft instead of sending immediately, so the forward can be reviewed first."),
+  }, async ({ messageId, to, cc, bcc, note, includeAttachments, includeSignature, asDraft }) => {
+    const original = await api.users.messages.get({ userId: "me", id: messageId, format: "full" });
+    const headers = original.data.payload?.headers;
+
+    const originalHeaderFields: ForwardHeaderFields = {
+      from: getHeader(headers, "from"),
+      date: getHeader(headers, "date"),
+      subject: getHeader(headers, "subject"),
+      to: getHeader(headers, "to"),
+      cc: getHeader(headers, "cc") || undefined,
+    };
+    const messageIdHeader = getHeader(headers, "message-id");
+    const references = getHeader(headers, "references");
+
+    const parsed = parseForwardContent(original.data.payload);
+    const selected = selectForwardAttachments(parsed, includeAttachments);
+
+    // Cheap pre-download size estimate from Gmail's already-known body.size
+    // on each selected part, before fetching a single attachment byte — a
+    // forward that's already way over the limit shouldn't cost a multi-MB
+    // download just to be refused afterward.
+    const selectedParts = [...selected.inlineImages, ...selected.attachments];
+    const bodyBytes = Buffer.byteLength(parsed.text, "utf-8") + Buffer.byteLength(parsed.html, "utf-8");
+    const estimate = estimateForwardSize(selectedParts, bodyBytes);
+    if (!estimate.ok) {
+      return textResult({
+        error: `Forward is too large to send: an estimated ${estimate.estimatedBytes} bytes, over Gmail's ${estimate.limitBytes}-byte send limit, before even fetching attachment bytes.`,
+        estimatedBytes: estimate.estimatedBytes,
+        limitBytes: estimate.limitBytes,
+        largestAttachments: largestAttachments(selectedParts.map((a) => ({ filename: a.filename, size: a.size }))),
+        suggestion: "Retry with includeAttachments:false to drop regular attachments (inline images are always kept, since they're part of the body).",
+      });
+    }
+
+    // Only fetch bytes for what we're actually keeping — a dropped attachment
+    // (includeAttachments:false) never costs a network round trip.
+    const { inlineImages, attachments } = await resolveForwardLeaves(api, messageId, selected.inlineImages, selected.attachments);
+
+    let signature: { text: string; html: string } | undefined;
+    let signatureWarning: string | undefined;
+    if (includeSignature) {
+      try {
+        const sendAsRes = await api.users.settings.sendAs.list({ userId: "me" });
+        const target = pickSendAs(sendAsRes.data.sendAs || []);
+        // Uncapped: a signature is never long enough to need the 50k display
+        // cap, but htmlToText's truncation note has no business ending up
+        // inside an outgoing message if it somehow were.
+        if (target?.signature) signature = { html: target.signature, text: htmlToText(target.signature, Infinity) };
+      } catch (err) {
+        // The signature is a nice-to-have on a forward, not a requirement —
+        // a lookup failure shouldn't block it, but the caller is told it was skipped.
+        signatureWarning = `Signature omitted: lookup failed (${err instanceof Error ? err.message : String(err)}).`;
+      }
+    }
+
+    const raw = buildForwardRawEmail({
+      to,
+      cc,
+      bcc,
+      originalSubject: originalHeaderFields.subject,
+      originalHeaderFields,
+      note,
+      signature,
+      originalBody: { text: parsed.text, html: parsed.html },
+      inlineImages,
+      attachments,
+      inReplyTo: messageIdHeader || undefined,
+      references: messageIdHeader ? buildReferencesChain(references, messageIdHeader) : undefined,
+    });
+
+    const sizeCheck = checkForwardRawSize(raw);
+    if (!sizeCheck.ok) {
+      const biggest = largestAttachments(selectedParts.map((a) => ({ filename: a.filename, size: a.size })));
+      return textResult({
+        error: `Forward is too large to send: the MIME message is ${sizeCheck.totalBytes} bytes, over Gmail's ${sizeCheck.limitBytes}-byte send limit.`,
+        totalBytes: sizeCheck.totalBytes,
+        limitBytes: sizeCheck.limitBytes,
+        largestAttachments: biggest,
+        suggestion: "Retry with includeAttachments:false to drop regular attachments (inline images are always kept, since they're part of the body).",
+      });
+    }
+
+    const warnings = [signatureWarning, ...parsed.warnings].filter((w): w is string => !!w);
+    const encodedRaw = encodeBase64Url(raw);
+    const threadId = original.data.threadId || undefined;
+    if (asDraft) {
+      const res = await api.users.drafts.create({ userId: "me", requestBody: { message: { raw: encodedRaw, threadId } } });
+      return textResult({ draftId: res.data.id, messageId: res.data.message?.id, threadId: res.data.message?.threadId, ...(warnings.length && { warning: warnings.join(" ") }) });
+    }
+    const res = await api.users.messages.send({ userId: "me", requestBody: { raw: encodedRaw, threadId } });
+    return textResult({ id: res.data.id, threadId: res.data.threadId, ...(warnings.length && { warning: warnings.join(" ") }) });
   });
 
   server.tool("gmail_modify_email", "Modify email labels (add/remove)", {
