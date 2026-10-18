@@ -17,7 +17,7 @@ import {
   extractBody,
   formatMessage,
   getHeader,
-  htmlToText,
+  htmlToOutgoingText,
   type EmailAttachment,
   type InlineImagePart,
   type OriginalMessageHeaders,
@@ -481,10 +481,9 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       try {
         const sendAsRes = await api.users.settings.sendAs.list({ userId: "me" });
         const target = pickSendAs(sendAsRes.data.sendAs || []);
-        // Uncapped: a signature is never long enough to need the 50k display
-        // cap, but htmlToText's truncation note has no business ending up
-        // inside an outgoing message if it somehow were.
-        if (target?.signature) signature = { html: target.signature, text: htmlToText(target.signature, Infinity) };
+        // Outgoing text: no link targets, notes or display cap, which are for
+        // bodies shown to the caller.
+        if (target?.signature) signature = { html: target.signature, text: htmlToOutgoingText(target.signature) };
       } catch (err) {
         // The signature is a nice-to-have on a forward, not a requirement —
         // a lookup failure shouldn't block it, but the caller is told it was skipped.

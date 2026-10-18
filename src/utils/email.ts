@@ -1,4 +1,5 @@
 import { gmail_v1 } from "googleapis";
+import { defaultTreeAdapter, parse, type DefaultTreeAdapterMap, type DefaultTreeAdapterTypes, type TreeAdapter } from "parse5";
 
 /** Decodes a Gmail base64url string to raw bytes (safe for binary content like attachments). */
 export function decodeBase64UrlToBuffer(data: string): Buffer {
@@ -403,29 +404,6 @@ export function extractAttachments(payload: gmail_v1.Schema$MessagePart | undefi
   return attachments;
 }
 
-const NAMED_HTML_ENTITIES: Record<string, string> = {
-  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
-  copy: "©", reg: "®", trade: "™",
-  mdash: "—", ndash: "–", hellip: "…",
-  lsquo: "‘", rsquo: "’", ldquo: "“", rdquo: "”",
-};
-
-function decodeHtmlEntities(input: string): string {
-  return input.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, entity: string) => {
-    if (entity[0] === "#") {
-      const isHex = entity[1] === "x" || entity[1] === "X";
-      const codePoint = isHex ? parseInt(entity.slice(2), 16) : parseInt(entity.slice(1), 10);
-      if (Number.isNaN(codePoint)) return match;
-      try {
-        return String.fromCodePoint(codePoint);
-      } catch {
-        return match;
-      }
-    }
-    return NAMED_HTML_ENTITIES[entity] ?? match;
-  });
-}
-
 const DEFAULT_BODY_TEXT_MAX_LENGTH = 50_000;
 
 /**
@@ -439,52 +417,618 @@ export function capTextLength(text: string, maxLength = DEFAULT_BODY_TEXT_MAX_LE
   return `${shown}\n\n[truncated: showing ${maxLength} of ${text.length} characters]`;
 }
 
+/** Elements whose content is never shown as part of the body. */
+const HIDDEN_ELEMENTS = new Set([
+  // Document metadata: the title, styles and meta/link/base tags live here.
+  "head", "title", "style", "script",
+  // Inert or fallback content: a template is never rendered; the parser keeps
+  // iframe, noembed and noframes content as raw markup text, which no reader
+  // sees. noscript is not here: mail clients run without scripts and show it.
+  "template", "iframe", "noembed", "noframes",
+]);
+
 /**
- * Basic HTML -> plain text conversion used as a fallback when a message has
- * no text/plain part: drops <script>/<style> blocks entirely, turns <br>
- * into newlines, strips all remaining tags, decodes common HTML entities,
- * and caps the result length (with a note) so a huge HTML email can't blow
- * past response size limits.
+ * Elements that start and end on their own line (CSS `display: block`,
+ * `list-item` or a table box in the HTML rendering rules). A paragraph is
+ * set off by a blank line, as in plain-text mail.
+ */
+const BLOCK_ELEMENTS = new Set([
+  "address", "article", "aside", "blockquote", "body", "caption", "center", "dd", "details",
+  "dialog", "dir", "div", "dl", "dt", "fieldset", "figcaption", "figure", "footer", "form",
+  "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr", "html", "legend", "li",
+  "listing", "main", "menu", "nav", "ol", "p", "plaintext", "pre", "search", "section", "summary",
+  "table", "tbody", "tfoot", "thead", "tr", "ul", "xmp",
+]);
+
+/** Elements whose text keeps its whitespace and line breaks. */
+const PREFORMATTED_ELEMENTS = new Set(["pre", "listing", "plaintext", "xmp", "textarea"]);
+
+/** Link schemes worth showing outside the page; anything else (javascript:, data:, …) is dropped. */
+const LINK_SCHEMES = new Set(["http:", "https:", "webcal:", "mailto:", "tel:", "sms:"]);
+
+/**
+ * Percent-encodes everything but printable ASCII (spaces too, unless
+ * `keepSpaces`), and `<` `>`, so a target cannot be disguised or break out of
+ * its `<target>`.
+ */
+function displaySafe(s: string, keepSpaces = false): string {
+  return s.replace(keepSpaces ? /[^\x20-\x7E]|[<>]/gu : /[^\x21-\x7E]|[<>]/gu, (c) => {
+    try {
+      return encodeURIComponent(c);
+    } catch {
+      return "%EF%BF%BD";
+    }
+  });
+}
+
+/**
+ * Percent-decodes `s` for display, then re-encodes it with displaySafe, so
+ * control, bidi-override, zero-width and line separator characters cannot
+ * reorder, hide or forge what is shown. Spaces are kept only where
+ * `keepSpaces` (phone numbers); in an address a decoded space could forge a
+ * label such as `, cc: `.
+ */
+function displayDecoded(s: string, keepSpaces = false): string {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(s);
+  } catch {
+    decoded = s;
+  }
+  return displaySafe(decoded.trim(), keepSpaces);
+}
+
+/**
+ * The part of a mailto, tel or sms URL after the scheme, up to any query: the
+ * opaque path (`tel:+1555…`), or, written with `//`, the authority and path
+ * the URL parser splits it into (`tel://+1555…`, `mailto://user@host`).
+ */
+function opaqueBody(url: URL): string {
+  // In the serialized URL the first `?` or `#` starts the query or fragment.
+  let body = url.href.slice(url.protocol.length).split(/[?#]/)[0];
+  if (body.startsWith("//")) {
+    body = body.slice(2);
+    if (url.pathname === "/") body = body.slice(0, -1);
+  }
+  return body;
+}
+
+/**
+ * Every recipient of a mailto link: the address part plus any to, cc and bcc
+ * query fields, so a link cannot hide where it really sends. Query values are
+ * split by hand because URLSearchParams would turn `+` (valid in an address)
+ * into a space.
+ */
+function mailtoRecipients(url: URL): string | undefined {
+  const recipients: string[] = [];
+  const path = displayDecoded(opaqueBody(url));
+  if (path) recipients.push(path);
+  for (const field of url.search.slice(1).split("&")) {
+    const eq = field.indexOf("=");
+    const name = displayDecoded(eq < 0 ? field : field.slice(0, eq)).toLowerCase();
+    const value = eq < 0 ? "" : displayDecoded(field.slice(eq + 1));
+    if (!value) continue;
+    if (name === "to") recipients.push(value);
+    else if (name === "cc" || name === "bcc") recipients.push(`${name}: ${value}`);
+  }
+  return recipients.length ? recipients.join(", ") : undefined;
+}
+
+/**
+ * Where a link goes, as shown after its text: the href resolved the way a
+ * browser resolves it (WHATWG URL parsing, so `https:host`, backslashes and
+ * entity-encoded schemes reach their real destination), restricted to
+ * LINK_SCHEMES. A scheme-relative `//host/path` is taken as https; relative
+ * paths and fragments have no meaning outside the page and are dropped.
+ * Addresses and numbers are shown bare; URLs as the browser would load them,
+ * minus any `user:password@` part, which only serves to make a link to one
+ * host read like another (`https://bank.example@evil.test/`).
+ */
+function linkTarget(href: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    if (!/^[\u0000-\u0020]*[\\/]{2}/.test(href.replace(/[\t\n\r]/g, ""))) return undefined;
+    try {
+      url = new URL(href, "https://scheme-relative.invalid/");
+    } catch {
+      return undefined;
+    }
+  }
+  if (!LINK_SCHEMES.has(url.protocol)) return undefined;
+  if (url.protocol === "mailto:") return mailtoRecipients(url);
+  if (url.protocol === "tel:" || url.protocol === "sms:") return displayDecoded(opaqueBody(url), true) || undefined;
+  url.username = "";
+  url.password = "";
+  // Special schemes (http, https) are already serialized percent-encoded; an
+  // opaque webcal: URL is not.
+  return displaySafe(url.href);
+}
+
+/**
+ * Accumulates rendered text with HTML's whitespace rules: runs of whitespace
+ * in ordinary text collapse to one space, spaces at line edges disappear,
+ * and line breaks requested by adjacent block boundaries merge into the
+ * largest one rather than adding up. Breaks and spaces are held until the
+ * next text, so a link's target can still be placed right after its text.
+ */
+class TextSink {
+  private parts: string[] = [];
+  private started = false;
+  private atLineStart = true;
+  private pendingSpace = false;
+  /** Breaks requested by block boundaries (the largest wins). */
+  private pendingBreaks = 0;
+  /** Breaks from <br> (each one counts). */
+  private pendingLineBreaks = 0;
+  /** Grows whenever text is written; a link compares it to tell whether it had text. */
+  visible = 0;
+
+  private flush(): void {
+    const breaks = this.pendingBreaks + this.pendingLineBreaks;
+    if (breaks > 0 && this.started) {
+      this.parts.push("\n".repeat(breaks));
+      this.atLineStart = true;
+    }
+    this.pendingBreaks = 0;
+    this.pendingLineBreaks = 0;
+    if (this.pendingSpace && !this.atLineStart) this.parts.push(" ");
+    this.pendingSpace = false;
+  }
+
+  /** Ordinary text, whitespace already collapsed to single spaces. */
+  text(s: string): void {
+    if (s.startsWith(" ")) {
+      this.pendingSpace = true;
+      s = s.slice(1);
+    }
+    if (!s) return;
+    const trailingSpace = s.endsWith(" ");
+    if (trailingSpace) s = s.slice(0, -1);
+    this.flush();
+    this.parts.push(s);
+    this.started = true;
+    this.atLineStart = false;
+    this.visible += s.length;
+    if (trailingSpace) this.pendingSpace = true;
+  }
+
+  /** Preformatted text, written as is. */
+  preformatted(s: string): void {
+    if (!s) return;
+    this.flush();
+    this.parts.push(s);
+    this.started = true;
+    this.atLineStart = s.endsWith("\n");
+    this.visible += s.replace(/\s/g, "").length;
+  }
+
+  space(): void {
+    this.pendingSpace = true;
+  }
+
+  /**
+   * Text that follows what was last written after a space, ahead of any line
+   * breaks requested since: a link's target stays next to its text even when
+   * the link ends with a <br> or an empty block. A space that ended the
+   * link's text is kept after the target, so it does not run into the next
+   * word.
+   */
+  trailer(s: string): void {
+    const { pendingBreaks, pendingLineBreaks, pendingSpace } = this;
+    this.pendingBreaks = 0;
+    this.pendingLineBreaks = 0;
+    this.pendingSpace = true;
+    this.text(s);
+    this.pendingBreaks = pendingBreaks;
+    this.pendingLineBreaks = pendingLineBreaks;
+    this.pendingSpace = pendingSpace;
+  }
+
+  lineBreak(): void {
+    this.pendingSpace = false;
+    this.pendingLineBreaks++;
+  }
+
+  blockBoundary(breaks: number): void {
+    this.pendingSpace = false;
+    this.pendingBreaks = Math.max(this.pendingBreaks, breaks);
+  }
+
+  toString(): string {
+    return this.parts.join("").replace(/\n{3,}/g, "\n\n").trim();
+  }
+}
+
+type ParsedElement = DefaultTreeAdapterTypes.Element;
+
+function isElement(node: DefaultTreeAdapterTypes.Node): node is ParsedElement {
+  return "tagName" in node;
+}
+
+/** True for a td/th (at `index` among its siblings) that follows another cell in the same row. */
+function followsCell(cell: ParsedElement, index: number): boolean {
+  const siblings = cell.parentNode?.childNodes ?? [];
+  for (let i = index - 1; i >= 0; i--) {
+    const sibling = siblings[i];
+    if (isElement(sibling)) return sibling.tagName === "td" || sibling.tagName === "th";
+  }
+  return false;
+}
+
+/*
+ * Limits past which HTML is not rendered at all. Real email stays far inside
+ * each of them; markup past them is hostile or broken, and tree construction
+ * on it can cost seconds to minutes on a server that handles one request at a
+ * time. Rendering part of such a message would be no more trustworthy than
+ * rendering none, so it is not shown (see HTML_NOT_SHOWN).
+ */
+
+/**
+ * Deepest element nesting, counting template contents as nested in their
+ * template (parse5 recurses once per open template at the end of input).
+ * Blink flattens the DOM at this depth.
+ */
+const MAX_NESTING = 512;
+
+/**
+ * Most attributes on one tag. The tokenizer checks each new attribute against
+ * the tag's earlier ones, so its cost grows with the square of the count.
+ */
+const MAX_ATTRIBUTES = 1000;
+
+/**
+ * Most work for one message, in the units parseMail charges: WORK_PER_CHAR
+ * for each character of input (the attribute scan, tokenizer and walk each
+ * pass over every one), the tokenizer's attribute comparisons, and the tree
+ * adapter's charges. On a sample of real
+ * mail the most any message used was about 2 million (a 478 KB HTML part);
+ * this allows about 4 MB of markup as dense as that, well past real mail
+ * (Gmail itself clips messages over 102 KB), and keeps a hostile message to
+ * under a second.
+ */
+const MAX_PARSE_WORK = 20_000_000;
+
+/** Work charged per input character; see MAX_PARSE_WORK. */
+const WORK_PER_CHAR = 4;
+
+/** What a reader is shown in place of HTML that is past those limits. */
+const HTML_NOT_SHOWN = "[HTML not shown: this message's HTML is far outside what real email contains]";
+
+class ParseLimitReached extends Error {}
+
+/**
+ * The attributes the tokenizer would collect per tag, counted from every
+ * `<` followed by a letter (or `</` and a letter), whether or not the
+ * tokenizer reaches it as a tag (it might be inside a comment, raw text or
+ * a quoted value). Starting everywhere means no misreading of comments, raw
+ * text or quotes earlier in the input can hide a tag from the count; it can
+ * only overcount. An overcount trips MAX_ATTRIBUTES early and also feeds the
+ * pair sum charged to the work budget, so starts inside one unterminated tag
+ * can exhaust the budget on small hostile input; real mail stays far below
+ * either limit. Each start is
+ * followed through the tokenizer's tag states (tag name, attribute name and
+ * value, quoted or not, self-closing) to the `>` that ends the tag. All
+ * starts are evaluated together in one backward pass: `next[s]` holds the
+ * number of attributes the tokenizer would still begin from state `s` at the
+ * following position, so the pass is linear in the input.
+ *
+ * Returns the most on any one tag, and the sum over tags of k(k-1)/2 for k
+ * attributes: the comparisons the tokenizer makes checking each attribute
+ * against the tag's earlier ones.
+ */
+function tagAttributeStats(html: string): { max: number; pairs: number } {
+  const TAG_NAME = 0, BEFORE_NAME = 1, NAME = 2, AFTER_NAME = 3, BEFORE_VALUE = 4,
+    DOUBLE_QUOTED = 5, SINGLE_QUOTED = 6, UNQUOTED = 7, AFTER_QUOTED = 8, SELF_CLOSING = 9;
+  let after2 = new Array<number>(10).fill(0);
+  let after1 = new Array<number>(10).fill(0);
+  let here = new Array<number>(10).fill(0);
+  const isAlpha = (code: number) => (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+  let max = 0;
+  let pairs = 0;
+  const count = (k: number) => {
+    max = Math.max(max, k);
+    pairs += (k * (k - 1)) / 2;
+  };
+  for (let i = html.length - 1; i >= 0; i--) {
+    const c = html.charCodeAt(i);
+    const x = after1;
+    const ws = c === 9 || c === 10 || c === 12 || c === 13 || c === 32;
+    const slash = c === 47, gt = c === 62, eq = c === 61, dq = c === 34, sq = c === 39;
+    here[TAG_NAME] = ws ? x[BEFORE_NAME] : slash ? x[SELF_CLOSING] : gt ? 0 : x[TAG_NAME];
+    here[NAME] = ws ? x[AFTER_NAME] : slash ? x[SELF_CLOSING] : gt ? 0 : eq ? x[BEFORE_VALUE] : x[NAME];
+    here[AFTER_NAME] = ws ? x[AFTER_NAME] : slash ? x[SELF_CLOSING] : gt ? 0 : eq ? x[BEFORE_VALUE] : 1 + x[NAME];
+    here[BEFORE_NAME] = ws ? x[BEFORE_NAME] : slash ? x[SELF_CLOSING] : gt ? 0 : 1 + x[NAME];
+    here[BEFORE_VALUE] = ws ? x[BEFORE_VALUE] : dq ? x[DOUBLE_QUOTED] : sq ? x[SINGLE_QUOTED] : gt ? 0 : x[UNQUOTED];
+    here[DOUBLE_QUOTED] = dq ? x[AFTER_QUOTED] : x[DOUBLE_QUOTED];
+    here[SINGLE_QUOTED] = sq ? x[AFTER_QUOTED] : x[SINGLE_QUOTED];
+    here[UNQUOTED] = ws ? x[BEFORE_NAME] : gt ? 0 : x[UNQUOTED];
+    here[AFTER_QUOTED] = ws ? x[BEFORE_NAME] : slash ? x[SELF_CLOSING] : gt ? 0 : 1 + x[NAME];
+    here[SELF_CLOSING] = gt ? 0 : ws ? x[BEFORE_NAME] : slash ? x[SELF_CLOSING] : 1 + x[NAME];
+    if (c === 60) {
+      // `<` + letter: the tokenizer enters the tag name at the letter (after1);
+      // `</` + letter: one position further (after2).
+      const d = html.charCodeAt(i + 1);
+      if (isAlpha(d)) count(after1[TAG_NAME]);
+      else if (d === 47 && isAlpha(html.charCodeAt(i + 2))) count(after2[TAG_NAME]);
+    }
+    [after2, after1, here] = [after1, here, after2];
+  }
+  return { max, pairs };
+}
+
+/**
+ * Parses `html` as a document with scripting off, as a mail client renders it,
+ * within the limits above; undefined when it is past any of them or the parse
+ * fails. The input's length and the tokenizer's attribute comparisons (from
+ * tagAttributeStats) are charged to a work budget first. Most tree
+ * construction work goes through the tree adapter, so the adapter
+ * charges every call to the same budget: one unit per call (the open
+ * element stack's scope checks call getNamespaceURI once per element they
+ * pass), plus the length of the child list that an insertBefore,
+ * insertTextBefore or detachNode searches and splices, plus the ancestors
+ * walked to check nesting. adoptAttributes, which merges the attributes of a
+ * repeated <html> or <body> tag into the first, does nothing: nothing reads
+ * attributes of html or body, and merging them is quadratic.
+ *
+ * Not charged: the parser's own scans of its open-element stack outside the
+ * adapter, e.g. reconstructing active formatting elements before each
+ * character token. Text under a formatting element several hundred levels
+ * deep therefore costs more per unit than the budget assumes (a few seconds
+ * at the budget's edge on hostile input); real mail nests far shallower.
+ */
+function parseMail(html: string): { doc?: DefaultTreeAdapterTypes.Document; work: number } {
+  let work = 0;
+  const charge = (units: number) => {
+    work += units;
+    if (work > MAX_PARSE_WORK) throw new ParseLimitReached();
+  };
+  const templateOf = new WeakMap<DefaultTreeAdapterTypes.DocumentFragment, DefaultTreeAdapterTypes.Template>();
+  const checkNesting = (parent: DefaultTreeAdapterTypes.ParentNode, node: DefaultTreeAdapterTypes.ChildNode) => {
+    if (!isElement(node)) return;
+    let depth = 0;
+    for (let n: DefaultTreeAdapterTypes.ParentNode | null | undefined = parent; n && depth < MAX_NESTING; depth++) {
+      n = "parentNode" in n ? n.parentNode : templateOf.get(n as DefaultTreeAdapterTypes.DocumentFragment);
+    }
+    charge(depth);
+    if (depth >= MAX_NESTING) throw new ParseLimitReached();
+  };
+  const charged = {} as Record<string, (...args: unknown[]) => unknown>;
+  for (const [name, fn] of Object.entries(defaultTreeAdapter)) {
+    charged[name] = (...args: unknown[]) => {
+      charge(1);
+      return (fn as (...a: unknown[]) => unknown).apply(defaultTreeAdapter, args);
+    };
+  }
+  const base = charged as unknown as TreeAdapter<DefaultTreeAdapterMap>;
+  const treeAdapter: TreeAdapter<DefaultTreeAdapterMap> = {
+    ...base,
+    setTemplateContent: (template, content) => {
+      templateOf.set(content, template);
+      base.setTemplateContent(template, content);
+    },
+    appendChild: (parent, node) => {
+      checkNesting(parent, node);
+      base.appendChild(parent, node);
+    },
+    insertBefore: (parent, node, reference) => {
+      checkNesting(parent, node);
+      charge(parent.childNodes.length);
+      base.insertBefore(parent, node, reference);
+    },
+    insertTextBefore: (parent, text, reference) => {
+      charge(parent.childNodes.length);
+      base.insertTextBefore(parent, text, reference);
+    },
+    detachNode: (node) => {
+      charge(node.parentNode?.childNodes.length ?? 0);
+      base.detachNode(node);
+    },
+    // The list of active formatting elements compares attribute lists it gets here.
+    getAttrList: (element) => {
+      charge(element.attrs.length);
+      return base.getAttrList(element);
+    },
+    adoptAttributes: () => charge(1),
+  };
+  try {
+    charge(html.length * WORK_PER_CHAR);
+    const attributes = tagAttributeStats(html);
+    if (attributes.max > MAX_ATTRIBUTES) return { work };
+    charge(attributes.pairs);
+    return { doc: parse(html, { treeAdapter, scriptingEnabled: false }), work };
+  } catch {
+    return { work };
+  }
+}
+
+/** walkToText, or undefined if it fails. */
+function renderDoc(doc: DefaultTreeAdapterTypes.Document, linkTargets: boolean): string | undefined {
+  try {
+    return walkToText(doc, linkTargets);
+  } catch {
+    return undefined;
+  }
+}
+
+/** A link's href: the plain `href` (what HTML and SVG 2 follow), else SVG's `xlink:href`. */
+function hrefOf(element: ParsedElement): string | undefined {
+  return (element.attrs.find((a) => a.name === "href" && !a.namespace) ?? element.attrs.find((a) => a.name === "href"))?.value;
+}
+
+/**
+ * Renders a document parsed by parseMail (parse5, the WHATWG parsing algorithm
+ * a browser uses) as plain text by walking the tree. The body is parsed as a full
+ * document because a MIME text/html part is one: its own head (title, styles)
+ * stays out of the body, and markup outside <html> lands where a browser puts
+ * it. Comments and HIDDEN_ELEMENTS are skipped. Images contribute nothing:
+ * their alt text is mostly logos and spacers, and counting it would tilt the
+ * text/plain-versus-HTML comparison in bestBodyText.
+ *
+ * With `linkTargets`, each link (`<a>`, or an image-map `<area>` with its
+ * alt text as the link text) with a target from linkTarget is followed by
+ * ` <target>`, or is just `<target>` when it has no text, however its text
+ * reads: the href is where the link goes, and link text can imitate any URL.
+ *
+ * The walk is iterative, so deep markup cannot overflow the stack.
+ */
+function walkToText(doc: DefaultTreeAdapterTypes.Document, linkTargets: boolean): string {
+  const sink = new TextSink();
+  type Step = { node: DefaultTreeAdapterTypes.Node; index: number; exit?: () => void };
+  const stack: Step[] = [{ node: doc, index: 0 }];
+  let preDepth = 0;
+  while (stack.length > 0) {
+    const step = stack.pop()!;
+    if (step.exit) {
+      step.exit();
+      continue;
+    }
+    const node = step.node;
+    if (node.nodeName === "#text") {
+      const value = (node as DefaultTreeAdapterTypes.TextNode).value;
+      if (preDepth > 0) sink.preformatted(value.replace(/\xA0/g, " "));
+      else sink.text(value.replace(/[\t\n\f\r \xA0]+/g, " "));
+      continue;
+    }
+    if (!("childNodes" in node)) continue; // comments and doctypes
+    const exits: Array<() => void> = [];
+    if (isElement(node)) {
+      const tag = node.tagName;
+      if (HIDDEN_ELEMENTS.has(tag)) continue;
+      if (tag === "br") {
+        sink.lineBreak();
+        continue;
+      }
+      const href = tag === "a" || tag === "area" ? hrefOf(node) : undefined;
+      const target = linkTargets && href !== undefined ? linkTarget(href) : undefined;
+      if (tag === "area") {
+        const alt = (node.attrs.find((a) => a.name === "alt")?.value ?? "").replace(/[\t\n\f\r \xA0]+/g, " ").trim();
+        if (target !== undefined && alt) {
+          sink.text(` ${alt}`);
+          sink.trailer(`<${target}>`);
+          sink.space();
+        } else if (target !== undefined) {
+          sink.text(` <${target}> `);
+        }
+        continue;
+      }
+      if (BLOCK_ELEMENTS.has(tag)) {
+        const breaks = tag === "p" ? 2 : 1;
+        sink.blockBoundary(breaks);
+        exits.push(() => sink.blockBoundary(breaks));
+      }
+      if ((tag === "td" || tag === "th") && followsCell(node, step.index)) sink.space();
+      if (PREFORMATTED_ELEMENTS.has(tag)) {
+        preDepth++;
+        exits.push(() => preDepth--);
+      }
+      if (target !== undefined) {
+        const visibleBefore = sink.visible;
+        exits.push(() => {
+          if (sink.visible > visibleBefore) sink.trailer(`<${target}>`);
+          else sink.text(` <${target}> `);
+        });
+      }
+    }
+    if (exits.length) stack.push({ node, index: step.index, exit: () => exits.reverse().forEach((f) => f()) });
+    const children = node.childNodes;
+    for (let i = children.length - 1; i >= 0; i--) stack.push({ node: children[i], index: i });
+  }
+  return sink.toString();
+}
+
+/**
+ * HTML -> plain text for the reader of a message (the model): link targets
+ * after every link, or HTML_NOT_SHOWN for HTML past the parse limits; capped
+ * (with a note) so a huge HTML email can't blow past response size limits.
  */
 export function htmlToText(html: string, maxLength = DEFAULT_BODY_TEXT_MAX_LENGTH): string {
-  let text = html.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, "");
-  text = text.replace(/<br\s*\/?>/gi, "\n");
-  text = text.replace(/<[^>]+>/g, "");
-  text = decodeHtmlEntities(text);
-  text = text
-    .replace(/[ \t]+/g, " ")
-    .replace(/[ \t]*\n[ \t]*/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  return readerText(parseMail(html).doc, maxLength);
+}
 
-  return capTextLength(text, maxLength);
+/** The reader's text for a parseMail result: the walk with link targets, or HTML_NOT_SHOWN. */
+function readerText(doc: DefaultTreeAdapterTypes.Document | undefined, maxLength: number): string {
+  return capTextLength((doc && renderDoc(doc, true)) ?? HTML_NOT_SHOWN, maxLength);
+}
+
+/**
+ * HTML -> plain text for mail being sent (a derived text/plain alternative,
+ * a signature): the text as written, without the link targets htmlToText
+ * adds for the reader, uncapped, and empty (never a note) for HTML past the
+ * parse limits.
+ */
+export function htmlToOutgoingText(html: string): string {
+  const { doc } = parseMail(html);
+  return (doc && renderDoc(doc, false)) ?? "";
 }
 
 /**
  * Characters that carry no content but are not stripped by String#trim():
  * zero-width space/non-joiner/joiner, word joiner, combining grapheme joiner,
- * Mongolian vowel separator. Newsletter platforms pad with these.
+ * Mongolian vowel separator, soft hyphen. Newsletter platforms pad with these.
  */
-const BLANK_CHARS = /[\s\u200B-\u200D\u2060\u034F\u180E]/gu;
+const BLANK_CHARS = /[\s\u200B-\u200D\u2060\u034F\u180E\u00AD]/gu;
+
+/**
+ * URLs and addresses as they appear in the text: `<…>`-delimited targets, the
+ * form plain-text mail uses, and bare URLs limited to URL characters (RFC 3986) so a
+ * URL that runs straight into unspaced text, as in CJK, does not swallow it.
+ */
+const URL_TOKENS = /<[^\s<>]+>|(?:https?:\/\/|mailto:)[\w\-.~:/?#[\]@!$&'()*+,;=%]+/gi;
+
+/**
+ * Visible prose length: what remains after removing URLs and blank or
+ * zero-width characters. URLs are excluded so that long tracking links in the
+ * HTML (or a long "view online" URL in a stub) do not decide the comparison.
+ */
+function proseLength(text: string): number {
+  return text.replace(URL_TOKENS, "").replace(BLANK_CHARS, "").length;
+}
+
+/**
+ * A text/plain part with under 1/STUB_RATIO of the HTML's prose is treated as
+ * a stub ("best viewed in HTML", "view in browser") rather than an
+ * alternative rendering. A full alternative carries most of its HTML's
+ * prose; on sampled real mail none fell below 1/3. Below it are pointers to
+ * the HTML with a footer, and teasers that render only part of a much
+ * longer HTML message; in both, the HTML holds content the text/plain part
+ * lacks. A stub with a long footer can stay above 1/3 and is returned as the
+ * body; a lower ratio would start replacing full alternatives with flattened
+ * HTML.
+ */
+const STUB_RATIO = 3;
 
 /**
  * Pick the best readable body for a message.
  *
- * Prefers text/plain, but only when it actually has content. An HTML-only
- * sender still emits a text/plain part, typically whitespace or zero-width
- * padding; that stub is truthy, so a bare truthiness test returns it and
- * discards the HTML alternative along with the whole message body.
+ * Prefers text/plain, but only when it actually has content and is a real
+ * rendering of the message. An HTML-only sender still emits a text/plain
+ * part, either whitespace or zero-width padding, or a one-line stub pointing
+ * at the HTML; returning it would discard the actual message body. Content is
+ * compared structurally (prose length) rather than by matching stub phrases,
+ * which vary by sender and language.
  *
- * Both branches go through the same cap: htmlToText caps internally, and the
- * trimmed plain text is capped here.
+ * Both branches go through the same cap.
  */
 export function bestBodyText(
   body: { text: string; html: string },
   maxLength = DEFAULT_BODY_TEXT_MAX_LENGTH,
 ): string {
   const text = body.text.trim();
-  if (text.replace(BLANK_CHARS, "") !== "") return capTextLength(text, maxLength);
-  return body.html ? htmlToText(body.html, maxLength) : "";
+  const hasText = text.replace(BLANK_CHARS, "") !== "";
+  if (!body.html) return hasText ? capTextLength(text, maxLength) : "";
+  // The HTML's prose cannot exceed its length (entities only shorten text), so
+  // a text/plain part that wins against that needs no parse at all.
+  if (hasText && proseLength(text) * STUB_RATIO >= body.html.length) return capTextLength(text, maxLength);
+  const { doc } = parseMail(body.html);
+  if (hasText) {
+    // Measured without the link targets htmlToText adds, so the number of
+    // links cannot decide which part is returned.
+    const prose = doc && renderDoc(doc, false);
+    if (prose === undefined || proseLength(text) * STUB_RATIO >= proseLength(prose)) return capTextLength(text, maxLength);
+  }
+  return readerText(doc, maxLength);
 }
 
 export function formatMessage(msg: gmail_v1.Schema$Message): Record<string, unknown> {

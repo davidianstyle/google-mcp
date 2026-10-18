@@ -83,6 +83,11 @@ describe("deriveMissingBodyPart", () => {
     expect(text).toBe("Hello & welcome");
   });
 
+  it("derives an outgoing text/plain alternative without the reader's link targets", () => {
+    const { text } = deriveMissingBodyPart({ text: "", html: '<p>See <a href="https://example.com/doc">the doc</a></p>' });
+    expect(text).toBe("See the doc");
+  });
+
   it("leaves both parts untouched when both are present", () => {
     const original = { text: "plain", html: "<p>rich</p>" };
     expect(deriveMissingBodyPart(original)).toEqual(original);
