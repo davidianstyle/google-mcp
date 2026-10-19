@@ -123,6 +123,78 @@ function hasExplicitOffset(dateTime: string): boolean {
   return HAS_OFFSET_PATTERN.test(dateTime);
 }
 
+// Epoch seconds for a wall-clock "YYYY-MM-DDTHH:MM[:SS]" in an IANA zone, or
+// undefined when the string or zone can't be resolved. Two passes of
+// "subtract the zone's offset at the current guess" settle across DST edges.
+function zonedLocalToEpoch(local: string, timeZone: string): number | undefined {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/.exec(local);
+  if (!m) return undefined;
+  const wall = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] ?? 0));
+  let fmt: Intl.DateTimeFormat;
+  try {
+    fmt = new Intl.DateTimeFormat("en-US", { timeZone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" });
+  } catch {
+    return undefined;
+  }
+  const offsetAt = (t: number) => {
+    const p = Object.fromEntries(fmt.formatToParts(new Date(t)).map((x) => [x.type, Number(x.value)]));
+    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - t;
+  };
+  let t = wall;
+  for (let i = 0; i < 2; i++) t = wall - offsetAt(t);
+  return Math.floor(t / 1000);
+}
+
+function toEpoch(dateTime: string, timeZone: string | null | undefined): number | undefined {
+  if (hasExplicitOffset(dateTime)) {
+    const ms = Date.parse(dateTime);
+    return Number.isNaN(ms) ? undefined : Math.floor(ms / 1000);
+  }
+  return timeZone ? zonedLocalToEpoch(dateTime, timeZone) : undefined;
+}
+
+// Whether a returned start/end matches what was sent. Timed values compare as
+// instants, because the API renders dateTime in the calendar's offset rather
+// than echoing the input. undefined means it can't be decided, which is never
+// reported as a mismatch.
+function sameBoundary(sent: calendar_v3.Schema$EventDateTime, got: calendar_v3.Schema$EventDateTime | undefined): boolean | undefined {
+  if (sent.date) return got?.date === sent.date;
+  if (!sent.dateTime) return undefined;
+  if (!got?.dateTime) return false;
+  const want = toEpoch(sent.dateTime, sent.timeZone || got.timeZone);
+  const have = toEpoch(got.dateTime, got.timeZone);
+  return want === undefined || have === undefined ? undefined : want === have;
+}
+
+// Values an event holds when a field is unset. The API omits a field at its
+// default, so sending the default and getting the field back absent is a match.
+const SCALAR_DEFAULTS = {
+  summary: "", description: "", location: "", colorId: "",
+  visibility: "default", transparency: "opaque",
+  guestsCanModify: false, guestsCanInviteOthers: true, guestsCanSeeOtherGuests: true,
+} as const;
+
+/**
+ * Names the fields of a patch body that the returned event does not reflect.
+ * events.patch can succeed without applying some fields (e.g. the time on a
+ * guest's copy of an event someone else organizes), so the response is the
+ * only evidence of what took effect. Covers start/end and the scalar fields;
+ * attendees, reminders and recurrence are left unchecked because the API
+ * reorders and normalizes them.
+ */
+export function unappliedFields(sent: calendar_v3.Schema$Event, got: calendar_v3.Schema$Event): string[] {
+  const out: string[] = [];
+  for (const key of ["start", "end"] as const) {
+    const s = sent[key];
+    if (s && sameBoundary(s, got[key]) === false) out.push(key);
+  }
+  for (const [key, dflt] of Object.entries(SCALAR_DEFAULTS) as [keyof typeof SCALAR_DEFAULTS, unknown][]) {
+    if (sent[key] === undefined) continue;
+    if ((sent[key] ?? dflt) !== (got[key] ?? dflt)) out.push(key);
+  }
+  return out;
+}
+
 // Caches each calendar's default timeZone for the lifetime of the process,
 // so defaulting a timed event to "the calendar's own timezone" costs at
 // most one calendars.get per calendarId rather than one per create call.
@@ -375,6 +447,16 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
       sendUpdates: opts.sendUpdates,
       requestBody,
     });
+    const unapplied = unappliedFields(requestBody, res.data);
+    if (unapplied.length) {
+      const hint = res.data.organizer?.self
+        ? ""
+        : " The authenticated account is not this event's organizer; Google can accept an update to a guest's copy of an event without applying changes to shared fields such as its time.";
+      return {
+        content: [{ type: "text" as const, text: `Update incomplete: the API accepted the request but did not apply: ${unapplied.join(", ")}.${hint} Other requested fields applied. Event as stored now: ${JSON.stringify(formatEvent(res.data))}` }],
+        isError: true,
+      };
+    }
     return textResult(formatEvent(res.data ));
   });
 
