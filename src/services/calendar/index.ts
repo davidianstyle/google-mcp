@@ -3,11 +3,10 @@ import { google } from "googleapis";
 import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
-import { mapGoogleError } from "../../utils/errors.js";
+import { mapGoogleError, isPreconditionFailedError } from "../../utils/errors.js";
 import { proposeTimes, parseHhMm, type Interval } from "../../utils/propose-times.js";
 
 import { calendar_v3 } from "googleapis";
-import { isPreconditionFailedError } from "../../utils/errors.js";
 
 // Mirrors Google Calendar v3 Event attendee resource. Shared by create and
 // update so an attendee list read via calendar_get_event can be written back.
@@ -399,7 +398,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
         needsExistingTimeZone ? "start(timeZone),end(timeZone)" : null,
       ].filter(Boolean).join(",");
       existing = (await cal.events.get({ calendarId: opts.calendarId, eventId: opts.eventId, fields })).data;
-      if (opts.attendees !== undefined) requestBody.attendees = toWritableAttendees(opts.attendees, existing?.attendees);
+      if (opts.attendees !== undefined) requestBody.attendees = toWritableAttendees(opts.attendees, existing.attendees);
       return existing.etag;
     };
     const firstEtag = await readLive();
