@@ -83,7 +83,7 @@ describe("calendar attendee schema (create/update)", () => {
   type Handler = (opts: Record<string, unknown>) => Promise<unknown>;
   const setup = async () => {
     const patch = vi.fn().mockResolvedValue({ data: { id: "evt1" } });
-    const get = vi.fn().mockResolvedValue({ data: { attendees: [] } });
+    const get = vi.fn().mockResolvedValue({ data: { etag: '"e1"', attendees: [] } });
     vi.spyOn(google, "calendar").mockReturnValue({ events: { patch, get } } as never);
     const tools = new Map<string, { shape: z.ZodRawShape; handler: Handler }>();
     const server = { tool: (name: string, _d: string, shape: z.ZodRawShape, handler: Handler) => { tools.set(name, { shape, handler }); } };
@@ -156,7 +156,7 @@ describe("calendar_update_event RSVP preservation", () => {
   type Handler = (opts: Record<string, unknown>) => Promise<unknown>;
   const run = async (liveData: unknown, input: Record<string, unknown>) => {
     const patch = vi.fn().mockResolvedValue({ data: { id: "evt1" } });
-    const get = vi.fn().mockResolvedValue({ data: liveData });
+    const get = vi.fn().mockResolvedValue({ data: { etag: '"e1"', ...(liveData as object) } });
     vi.spyOn(google, "calendar").mockReturnValue({ events: { patch, get } } as never);
     const tools = new Map<string, { shape: z.ZodRawShape; handler: Handler }>();
     registerCalendarTools({ tool: (n: string, _d: string, shape: z.ZodRawShape, handler: Handler) => { tools.set(n, { shape, handler }); } } as never, { auth: {} as never });
@@ -207,5 +207,179 @@ describe("calendar_update_event RSVP preservation", () => {
     const body = patch.mock.calls[0][0].requestBody;
     expect(body.attendees).toEqual([{ email: "a@x.com", responseStatus: "accepted" }]);
     expect(body.start).toEqual({ dateTime: "2026-07-06T10:00:00", timeZone: "America/New_York" });
+  });
+});
+
+type FakeAttendee = calendar_v3.Schema$EventAttendee;
+type FakeStore = { attendees: FakeAttendee[]; version: number; bump: () => void };
+
+// In-memory stand-in for one event on Google Calendar. Every write bumps the
+// etag, a patch carrying If-Match is refused with 412 when the etag no longer
+// matches, and an attendees array in a patch replaces the stored list whole,
+// as Google does.
+const fakeCalendar = (initial: FakeAttendee[], opts: { beforeEachPatch?: (store: FakeStore) => void; omitEtag?: boolean } = {}) => {
+  const store: FakeStore = { attendees: structuredClone(initial), version: 1, bump: () => { store.version++; } };
+  const etagOf = () => `"v${store.version}"`;
+  const get = vi.fn(async (_params?: unknown) => ({ data: { id: "evt1", etag: opts.omitEtag ? undefined : etagOf(), attendees: structuredClone(store.attendees) } }));
+  const patch = vi.fn(async (params: { requestBody: { attendees?: FakeAttendee[] } }, options?: { headers?: Record<string, string> }) => {
+    opts.beforeEachPatch?.(store);
+    const ifMatch = options?.headers?.["If-Match"];
+    if (ifMatch !== undefined && ifMatch !== etagOf()) {
+      throw Object.assign(new Error("Precondition Failed"), { response: { status: 412 } });
+    }
+    if (params.requestBody.attendees) store.attendees = structuredClone(params.requestBody.attendees);
+    store.bump();
+    return { data: { id: "evt1", etag: etagOf(), attendees: structuredClone(store.attendees) } };
+  });
+  return { store, get, patch };
+};
+
+// Registers the calendar tools from a freshly loaded module wired to the fake,
+// so the module's process-lifetime primary-email cache never carries over
+// from another test, and runs one tool.
+const runTool = async (fake: ReturnType<typeof fakeCalendar>, tool: string, input: Record<string, unknown>, primaryEmail?: string) => {
+  type Handler = (opts: Record<string, unknown>) => Promise<unknown>;
+  vi.resetModules();
+  const { google: g } = await import("googleapis");
+  const mod = await import("./index.js");
+  const calendarListGet = vi.fn(async () => ({ data: { id: primaryEmail } }));
+  vi.spyOn(g, "calendar").mockReturnValue({ events: { get: fake.get, patch: fake.patch }, calendarList: { get: calendarListGet } } as never);
+  const tools = new Map<string, { shape: z.ZodRawShape; handler: Handler }>();
+  mod.registerCalendarTools({ tool: (n: string, _d: string, shape: z.ZodRawShape, handler: Handler) => { tools.set(n, { shape, handler }); } } as never, { auth: {} as never });
+  const t = tools.get(tool)!;
+  return t.handler(z.object(t.shape).parse({ calendarId: "primary", eventId: "evt1", ...input }));
+};
+
+describe("calendar_respond_to_event", () => {
+  type Attendee = FakeAttendee;
+  const respond = (fake: ReturnType<typeof fakeCalendar>, input: Record<string, unknown>, primaryEmail?: string) =>
+    runTool(fake, "calendar_respond_to_event", input, primaryEmail);
+
+  const initial: Attendee[] = [
+    { email: "me@example.com", self: true, responseStatus: "needsAction", comment: "running late", additionalGuests: 2 },
+    { email: "other@example.com", responseStatus: "needsAction" },
+    { email: "third@example.com", displayName: "Third", optional: true, responseStatus: "tentative", comment: "maybe", additionalGuests: 1 },
+  ];
+
+  it("keeps an RSVP another attendee makes between the read and the write", async () => {
+    let raced = false;
+    const fake = fakeCalendar(initial, {
+      beforeEachPatch: (s) => {
+        if (raced) return;
+        raced = true;
+        s.attendees = s.attendees.map((a) => (a.email === "other@example.com" ? { ...a, responseStatus: "accepted", comment: "see you there" } : a));
+        s.bump();
+      },
+    });
+    await respond(fake, { responseStatus: "declined" });
+    expect(fake.store.attendees).toEqual([
+      { ...initial[0], responseStatus: "declined" },
+      { email: "other@example.com", responseStatus: "accepted", comment: "see you there" },
+      initial[2],
+    ]);
+  });
+
+  it("writes once, conditional on the read's etag, changing only the caller's responseStatus", async () => {
+    const fake = fakeCalendar(initial);
+    await respond(fake, { responseStatus: "accepted", sendUpdates: "none" });
+    expect(fake.patch).toHaveBeenCalledTimes(1);
+    expect(fake.patch.mock.calls[0][1]).toEqual({ headers: { "If-Match": '"v1"' } });
+    expect(fake.patch.mock.calls[0][0]).toMatchObject({ calendarId: "primary", eventId: "evt1", sendUpdates: "none" });
+    expect(fake.store.attendees).toEqual([{ ...initial[0], responseStatus: "accepted" }, initial[1], initial[2]]);
+  });
+
+  it("finds the caller by primary-calendar email when no attendee is flagged self", async () => {
+    const noSelf: Attendee[] = [{ email: "Someone@Example.com", responseStatus: "needsAction" }, { email: "other@example.com", responseStatus: "accepted" }];
+    const fake = fakeCalendar(noSelf);
+    await respond(fake, { responseStatus: "tentative" }, "someone@example.com");
+    expect(fake.store.attendees).toEqual([{ email: "Someone@Example.com", responseStatus: "tentative" }, noSelf[1]]);
+  });
+
+  it("gives up after 3 attempts with an error, having written nothing, when the event changes every time", async () => {
+    const fake = fakeCalendar(initial, { beforeEachPatch: (s) => s.bump() });
+    const err = await respond(fake, { responseStatus: "declined" }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/nothing was written/);
+    expect(((err as Error).cause as { response?: { status?: number } }).response?.status).toBe(412);
+    expect(fake.get).toHaveBeenCalledTimes(3);
+    expect(fake.patch).toHaveBeenCalledTimes(3);
+    expect(fake.store.attendees).toEqual(initial);
+  });
+
+  it("does not retry errors other than a precondition failure", async () => {
+    const fake = fakeCalendar(initial, {
+      beforeEachPatch: () => { throw Object.assign(new Error("Forbidden"), { response: { status: 403 } }); },
+    });
+    await expect(respond(fake, { responseStatus: "declined" })).rejects.toThrow(/Forbidden/);
+    expect(fake.patch).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses to write when the read carries no etag", async () => {
+    const fake = fakeCalendar(initial, { omitEtag: true });
+    await expect(respond(fake, { responseStatus: "declined" })).rejects.toThrow(/without an etag/);
+    expect(fake.patch).not.toHaveBeenCalled();
+  });
+
+  it("refuses, without writing, when the caller is not an attendee", async () => {
+    const fake = fakeCalendar([{ email: "other@example.com", responseStatus: "accepted" }]);
+    await expect(respond(fake, { responseStatus: "accepted" }, "me@example.com")).rejects.toThrow(/not an attendee/);
+    expect(fake.patch).not.toHaveBeenCalled();
+  });
+});
+
+describe("calendar_update_event attendee writes", () => {
+  const update = (fake: ReturnType<typeof fakeCalendar>, input: Record<string, unknown>) => runTool(fake, "calendar_update_event", input);
+  const live: FakeAttendee[] = [
+    { email: "a@example.com", responseStatus: "accepted", comment: "yes" },
+    { email: "b@example.com", responseStatus: "needsAction" },
+  ];
+  const input = { attendees: [{ email: "a@example.com" }, { email: "b@example.com" }, { email: "c@example.com", displayName: "C" }] };
+
+  it("keeps an RSVP an attendee makes between the read and the write", async () => {
+    let raced = false;
+    const fake = fakeCalendar(live, {
+      beforeEachPatch: (s) => {
+        if (raced) return;
+        raced = true;
+        s.attendees = s.attendees.map((a) => (a.email === "b@example.com" ? { ...a, responseStatus: "accepted", comment: "on my way" } : a));
+        s.bump();
+      },
+    });
+    await update(fake, input);
+    expect(fake.store.attendees).toEqual([
+      { email: "a@example.com", responseStatus: "accepted", comment: "yes" },
+      { email: "b@example.com", responseStatus: "accepted", comment: "on my way" },
+      { email: "c@example.com", displayName: "C" },
+    ]);
+  });
+
+  it("writes once, conditional on the etag its read asked for", async () => {
+    const fake = fakeCalendar(live);
+    await update(fake, input);
+    expect(fake.get).toHaveBeenCalledTimes(1);
+    expect((fake.get.mock.calls[0][0] as { fields: string }).fields.split(",")).toContain("etag");
+    expect(fake.patch).toHaveBeenCalledTimes(1);
+    expect(fake.patch.mock.calls[0][1]).toEqual({ headers: { "If-Match": '"v1"' } });
+  });
+
+  it("gives up after 3 attempts with an error, having written nothing, when the event changes every time", async () => {
+    const fake = fakeCalendar(live, { beforeEachPatch: (s) => s.bump() });
+    const err = await update(fake, input).catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/nothing was written/);
+    expect(fake.patch).toHaveBeenCalledTimes(3);
+    expect(fake.store.attendees).toEqual(live);
+  });
+
+  it("refuses to write attendees when the read carries no etag", async () => {
+    const fake = fakeCalendar(live, { omitEtag: true });
+    await expect(update(fake, input)).rejects.toThrow(/without an etag/);
+    expect(fake.patch).not.toHaveBeenCalled();
+  });
+
+  it("leaves an update without attendees unconditional and unread", async () => {
+    const fake = fakeCalendar(live);
+    await update(fake, { summary: "new title" });
+    expect(fake.get).not.toHaveBeenCalled();
+    expect(fake.patch.mock.calls[0][1]).toBeUndefined();
   });
 });

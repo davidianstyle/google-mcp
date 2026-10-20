@@ -7,6 +7,7 @@ import { mapGoogleError } from "../../utils/errors.js";
 import { proposeTimes, parseHhMm, type Interval } from "../../utils/propose-times.js";
 
 import { calendar_v3 } from "googleapis";
+import { isPreconditionFailedError } from "../../utils/errors.js";
 
 // Mirrors Google Calendar v3 Event attendee resource. Shared by create and
 // update so an attendee list read via calendar_get_event can be written back.
@@ -155,6 +156,46 @@ async function getPrimaryEmail(cal: calendar_v3.Calendar): Promise<string | unde
   }
   primaryEmailFetched = true;
   return cachedPrimaryEmail;
+}
+
+// A patch that sets attendees replaces the whole list, so a tool that writes
+// attendees sends every entry as of its last read; an RSVP made after that
+// read would be overwritten with its stale value. patchIfUnchanged makes such
+// a write conditional on that read's etag (If-Match). If the event changed in
+// between, Google refuses it with 412: refresh() re-reads the event, rebuilds
+// the request body in place and returns the new etag, and the patch is sent
+// again, up to PATCH_MAX_ATTEMPTS writes in total. Without a guard it is a
+// plain patch.
+const PATCH_MAX_ATTEMPTS = 3;
+
+interface PatchGuard {
+  /** What the caller was doing, for error messages: "respond", "update attendees". */
+  action: string;
+  etag: string | null | undefined;
+  refresh: () => Promise<string | null | undefined>;
+}
+
+async function patchIfUnchanged(
+  cal: calendar_v3.Calendar,
+  guard: PatchGuard | undefined,
+  params: calendar_v3.Params$Resource$Events$Patch,
+): Promise<{ data: calendar_v3.Schema$Event }> {
+  if (!guard) return cal.events.patch(params);
+  let etag = guard.etag;
+  for (let attempt = 1; ; attempt++) {
+    if (!etag) {
+      throw new Error(`Cannot ${guard.action}: event ${params.eventId} came back without an etag, so the attendee list cannot be written without risking other attendees' responses`);
+    }
+    try {
+      return await cal.events.patch(params, { headers: { "If-Match": etag } });
+    } catch (err) {
+      if (!isPreconditionFailedError(err)) throw err;
+      if (attempt >= PATCH_MAX_ATTEMPTS) {
+        throw new Error(`Cannot ${guard.action}: event ${params.eventId} changed during each of ${PATCH_MAX_ATTEMPTS} attempts; nothing was written. Try again.`, { cause: err });
+      }
+      etag = await guard.refresh();
+    }
+  }
 }
 
 const ALL_DAY_END_NOTE = "For all-day events, use a 'YYYY-MM-DD' date (no time). The end date is exclusive — a single-day event on 2026-06-22 has start '2026-06-22' and end '2026-06-23'.";
@@ -349,14 +390,22 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     );
     const needsLiveAttendees = opts.attendees !== undefined;
     let existing: calendar_v3.Schema$Event | undefined;
-    if (needsExistingTimeZone || needsLiveAttendees) {
+    // Runs again before each retry of an attendee write (see
+    // patchIfUnchanged), so the carried-over RSVPs come from a fresh read.
+    const readLive = async () => {
+      if (!needsExistingTimeZone && !needsLiveAttendees) return undefined;
       const fields = [
-        needsLiveAttendees ? "attendees(email,responseStatus,comment,additionalGuests)" : null,
+        needsLiveAttendees ? "etag,attendees(email,responseStatus,comment,additionalGuests)" : null,
         needsExistingTimeZone ? "start(timeZone),end(timeZone)" : null,
       ].filter(Boolean).join(",");
       existing = (await cal.events.get({ calendarId: opts.calendarId, eventId: opts.eventId, fields })).data;
-    }
-    if (opts.attendees !== undefined) requestBody.attendees = toWritableAttendees(opts.attendees, existing?.attendees);
+      if (opts.attendees !== undefined) requestBody.attendees = toWritableAttendees(opts.attendees, existing.attendees);
+      return existing.etag;
+    };
+    const firstEtag = await readLive();
+    const attendeeGuard: PatchGuard | undefined = needsLiveAttendees
+      ? { action: "update attendees", etag: firstEtag, refresh: readLive }
+      : undefined;
     const existingTimeZone = needsExistingTimeZone ? (existing?.start?.timeZone || existing?.end?.timeZone || undefined) : undefined;
 
     if (opts.start !== undefined || opts.end !== undefined) {
@@ -370,7 +419,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
       }
     }
 
-    const res = await cal.events.patch({
+    const res = await patchIfUnchanged(cal, attendeeGuard, {
       calendarId: opts.calendarId, eventId: opts.eventId,
       sendUpdates: opts.sendUpdates,
       requestBody,
@@ -412,24 +461,34 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     sendUpdates: z.enum(["all", "externalOnly", "none"]).optional(),
   }, async ({ calendarId, eventId, responseStatus, sendUpdates }) => {
     const cal = api;
-    const existing = await cal.events.get({ calendarId, eventId });
-    const attendees = existing.data.attendees || [];
-    let me = attendees.find((a) => a.self);
-    if (!me) {
-      const myEmail = await getPrimaryEmail(cal);
-      if (myEmail) {
-        me = attendees.find((a) => a.email?.toLowerCase() === myEmail);
+    // The write carries the whole attendee list (see patchIfUnchanged).
+    // attendeesOmitted with only the caller's entry is not used because Google
+    // rejects it when the organizer is a calendar the caller owns, which is
+    // the case the primary-email fallback below exists for.
+    const requestBody: calendar_v3.Schema$Event = {};
+    const readAndApply = async () => {
+      const existing = await cal.events.get({ calendarId, eventId });
+      const attendees = existing.data.attendees || [];
+      let me = attendees.find((a) => a.self);
+      if (!me) {
+        const myEmail = await getPrimaryEmail(cal);
+        if (myEmail) {
+          me = attendees.find((a) => a.email?.toLowerCase() === myEmail);
+        }
       }
-    }
-    if (!me) {
-      throw new Error(`Cannot respond: authenticated user is not an attendee of event ${eventId}`);
-    }
-    me.responseStatus = responseStatus;
+      if (!me) {
+        throw new Error(`Cannot respond: authenticated user is not an attendee of event ${eventId}`);
+      }
+      me.responseStatus = responseStatus;
+      requestBody.attendees = attendees;
+      return existing.data.etag;
+    };
 
-    const res = await cal.events.patch({
-      calendarId, eventId, sendUpdates,
-      requestBody: { attendees },
-    });
+    const res = await patchIfUnchanged(
+      cal,
+      { action: "respond", etag: await readAndApply(), refresh: readAndApply },
+      { calendarId, eventId, sendUpdates, requestBody },
+    );
     return textResult({ eventId: res.data.id, responseStatus });
   });
 
