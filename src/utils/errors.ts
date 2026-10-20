@@ -102,6 +102,15 @@ export function isInsufficientScopeError(error: unknown): boolean {
 }
 
 /**
+ * True for HTTP 412, Google's answer to a write whose If-Match etag no longer
+ * matches the stored resource.
+ */
+export function isPreconditionFailedError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  return (error as GaxiosLikeError).response?.status === 412;
+}
+
+/**
  * Builds a friendly, actionable message for a scope-insufficient 403: names
  * the specific missing scope and points at the re-auth fix, instead of the
  * generic "insufficient authentication scopes" Google returns. Callers should
