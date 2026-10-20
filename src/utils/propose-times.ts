@@ -51,7 +51,7 @@ const MINUTE_MS = 60_000;
 const DAY_MS = 24 * 60 * MINUTE_MS;
 
 /** Offset (ms) to add to a UTC instant to get this timezone's local wall clock at that instant. */
-function tzOffsetMs(timeZone: string, date: Date): number {
+export function tzOffsetMs(timeZone: string, date: Date): number {
   const dtf = new Intl.DateTimeFormat("en-US", {
     timeZone,
     hourCycle: "h23",
