@@ -56,6 +56,10 @@ By default every family registers. `--families gmail,calendar` restricts the ser
 - **Token persistence** — refreshed access tokens are written back to the per-account credentials file automatically.
 - **Downloads** — files fetched to disk land in a shared temp cache (`$TMPDIR/google-mcp`) that is swept of entries older than 24h.
 
+### Calendar notes
+
+- `calendar_update_event` checks the event Google returns against the request. If a checked field (start, end, summary, location, colorId, visibility, transparency, guestsCan*) did not take effect, which happens with the time on a guest's copy of an event someone else organizes, the call returns an error that lists the fields that did not apply, the fields checked and applied (those are saved), and the fields not checked (attendees, reminders, recurrence, description). A comparison it cannot decide, such as a local time inside a DST gap or with no known timezone, is listed as not checked, never as a failure. Callers should not blindly retry the whole call after this error: the applied fields are already saved, and resending can re-notify attendees.
+
 ### Gmail notes
 
 - `gmail_get_signature` reads the real signature configured in Gmail's UI (Settings > General > Signature) via `users.settings.sendAs.list`, and returns the HTML **verbatim** — it does not reconstruct or reformat it. `gmail_draft_email`/`gmail_send_email` do not inject the signature automatically (the Gmail API only sends the MIME it's given; the web/app UI normally adds the signature client-side), so fetch it with this tool first for anything that should carry it.

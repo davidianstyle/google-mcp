@@ -4,7 +4,7 @@ import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
 import { mapGoogleError } from "../../utils/errors.js";
-import { proposeTimes, parseHhMm, type Interval } from "../../utils/propose-times.js";
+import { proposeTimes, parseHhMm, tzOffsetMs, type Interval } from "../../utils/propose-times.js";
 
 import { calendar_v3 } from "googleapis";
 
@@ -123,30 +123,35 @@ function hasExplicitOffset(dateTime: string): boolean {
   return HAS_OFFSET_PATTERN.test(dateTime);
 }
 
-// Epoch seconds for a wall-clock "YYYY-MM-DDTHH:MM[:SS]" in an IANA zone, or
-// undefined when the string or zone can't be resolved. Two passes of
-// "subtract the zone's offset at the current guess" settle across DST edges.
+const LOCAL_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?$/;
+const OFFSET_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}:\d{2})$/;
+
+// Epoch seconds for a wall-clock time in an IANA zone, or undefined when it
+// doesn't name exactly one instant: a malformed string, an unknown zone, a
+// time skipped by a spring-forward gap, or a fall-back hour that occurs twice.
+// Each candidate offset (the zone's offset half a day either side) is kept
+// only if it is the offset actually in force at the instant it produces.
 function zonedLocalToEpoch(local: string, timeZone: string): number | undefined {
-  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/.exec(local);
+  const m = LOCAL_DATETIME.exec(local);
   if (!m) return undefined;
   const wall = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] ?? 0));
-  let fmt: Intl.DateTimeFormat;
+  const offset = (t: number) => tzOffsetMs(timeZone, new Date(t));
+  const instants = new Set<number>();
   try {
-    fmt = new Intl.DateTimeFormat("en-US", { timeZone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" });
+    for (const probe of [wall - 12 * 3600e3, wall + 12 * 3600e3]) {
+      const t = wall - offset(probe);
+      if (offset(t) === wall - t) instants.add(t);
+    }
   } catch {
     return undefined;
   }
-  const offsetAt = (t: number) => {
-    const p = Object.fromEntries(fmt.formatToParts(new Date(t)).map((x) => [x.type, Number(x.value)]));
-    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - t;
-  };
-  let t = wall;
-  for (let i = 0; i < 2; i++) t = wall - offsetAt(t);
-  return Math.floor(t / 1000);
+  return instants.size === 1 ? Math.floor([...instants][0] / 1000) : undefined;
 }
 
+// A timed boundary as epoch seconds. An offset-qualified value is read as-is;
+// a local one needs a zone. Any other form is undecidable.
 function toEpoch(dateTime: string, timeZone: string | null | undefined): number | undefined {
-  if (hasExplicitOffset(dateTime)) {
+  if (OFFSET_DATETIME.test(dateTime)) {
     const ms = Date.parse(dateTime);
     return Number.isNaN(ms) ? undefined : Math.floor(ms / 1000);
   }
@@ -155,13 +160,14 @@ function toEpoch(dateTime: string, timeZone: string | null | undefined): number 
 
 // Whether a returned start/end matches what was sent. Timed values compare as
 // instants, because the API renders dateTime in the calendar's offset rather
-// than echoing the input. undefined means it can't be decided, which is never
-// reported as a mismatch.
+// than echoing the input. A local time is read only in the zone that was sent
+// (given, or taken from the existing event): with neither, Google used the
+// calendar's default, which isn't known here. undefined means undecidable.
 function sameBoundary(sent: calendar_v3.Schema$EventDateTime, got: calendar_v3.Schema$EventDateTime | undefined): boolean | undefined {
   if (sent.date) return got?.date === sent.date;
   if (!sent.dateTime) return undefined;
   if (!got?.dateTime) return false;
-  const want = toEpoch(sent.dateTime, sent.timeZone || got.timeZone);
+  const want = toEpoch(sent.dateTime, sent.timeZone);
   const have = toEpoch(got.dateTime, got.timeZone);
   return want === undefined || have === undefined ? undefined : want === have;
 }
@@ -169,30 +175,41 @@ function sameBoundary(sent: calendar_v3.Schema$EventDateTime, got: calendar_v3.S
 // Values an event holds when a field is unset. The API omits a field at its
 // default, so sending the default and getting the field back absent is a match.
 const SCALAR_DEFAULTS = {
-  summary: "", description: "", location: "", colorId: "",
+  summary: "", location: "", colorId: "",
   visibility: "default", transparency: "opaque",
   guestsCanModify: false, guestsCanInviteOthers: true, guestsCanSeeOtherGuests: true,
 } as const;
+// Free text the API may trim or store with LF line endings.
+const TEXT_FIELDS = new Set(["summary", "location"]);
+const normalizeText = (v: unknown) => (typeof v === "string" ? v.replace(/\r\n/g, "\n").trim() : v);
+// Fields the API reorders, normalizes or sanitizes, so a difference in the
+// response isn't evidence the write was dropped.
+const UNCHECKED_FIELDS = ["attendees", "reminders", "recurrence", "description"] as const;
+
+export interface PatchCheck { applied: string[]; unapplied: string[]; unchecked: string[] }
 
 /**
- * Names the fields of a patch body that the returned event does not reflect.
+ * Sorts the fields of a patch body by what the returned event shows.
  * events.patch can succeed without applying some fields (e.g. the time on a
  * guest's copy of an event someone else organizes), so the response is the
- * only evidence of what took effect. Covers start/end and the scalar fields;
- * attendees, reminders and recurrence are left unchecked because the API
- * reorders and normalizes them.
+ * only evidence of what took effect. A field lands in `unapplied` only when
+ * the comparison is certain; anything undecidable goes to `unchecked`.
  */
-export function unappliedFields(sent: calendar_v3.Schema$Event, got: calendar_v3.Schema$Event): string[] {
-  const out: string[] = [];
+export function checkPatchApplied(sent: calendar_v3.Schema$Event, got: calendar_v3.Schema$Event): PatchCheck {
+  const result: PatchCheck = { applied: [], unapplied: [], unchecked: [] };
   for (const key of ["start", "end"] as const) {
     const s = sent[key];
-    if (s && sameBoundary(s, got[key]) === false) out.push(key);
+    if (!s) continue;
+    const same = sameBoundary(s, got[key]);
+    (same === undefined ? result.unchecked : same ? result.applied : result.unapplied).push(key);
   }
   for (const [key, dflt] of Object.entries(SCALAR_DEFAULTS) as [keyof typeof SCALAR_DEFAULTS, unknown][]) {
     if (sent[key] === undefined) continue;
-    if ((sent[key] ?? dflt) !== (got[key] ?? dflt)) out.push(key);
+    const norm = TEXT_FIELDS.has(key) ? normalizeText : (v: unknown) => v;
+    (norm(sent[key] ?? dflt) === norm(got[key] ?? dflt) ? result.applied : result.unapplied).push(key);
   }
-  return out;
+  for (const key of UNCHECKED_FIELDS) if (sent[key] !== undefined) result.unchecked.push(key);
+  return result;
 }
 
 // Caches each calendar's default timeZone for the lifetime of the process,
@@ -376,7 +393,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     return textResult(formatEvent(res.data ));
   });
 
-  server.tool("calendar_update_event", "Update an existing calendar event. When attendees is provided, existing attendees' RSVPs (responseStatus, comment, additionalGuests) are preserved from the live event; only new attendees start with no response.", {
+  server.tool("calendar_update_event", "Update an existing calendar event. When attendees is provided, existing attendees' RSVPs (responseStatus, comment, additionalGuests) are preserved from the live event; only new attendees start with no response. The returned event is checked against the request: if a checked field (start, end, summary, location, colorId, visibility, transparency, guestsCan*) did not take effect, as happens with the time on a guest's copy of an event someone else organizes, the call returns an error listing which fields did not apply, which were checked and applied (those did apply and are saved), and which were not checked (attendees, reminders, recurrence, description). Do not blindly retry the whole call after that error: the applied fields are already saved, and resending can re-notify attendees.", {
     calendarId: z.string(),
     eventId: z.string(),
     summary: z.string().optional(),
@@ -447,13 +464,17 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
       sendUpdates: opts.sendUpdates,
       requestBody,
     });
-    const unapplied = unappliedFields(requestBody, res.data);
-    if (unapplied.length) {
-      const hint = res.data.organizer?.self
-        ? ""
-        : " The authenticated account is not this event's organizer; Google can accept an update to a guest's copy of an event without applying changes to shared fields such as its time.";
+    const check = checkPatchApplied(requestBody, res.data);
+    if (check.unapplied.length) {
+      const list = (fields: string[]) => (fields.length ? fields.join(", ") : "none");
+      const hint = res.data.organizer && !res.data.organizer.self
+        ? " The authenticated account is not this event's organizer; Google can accept an update to a guest's copy of an event without applying changes to shared fields such as its time."
+        : "";
       return {
-        content: [{ type: "text" as const, text: `Update incomplete: the API accepted the request but did not apply: ${unapplied.join(", ")}.${hint} Other requested fields applied. Event as stored now: ${JSON.stringify(formatEvent(res.data))}` }],
+        content: [{
+          type: "text" as const,
+          text: `Update incomplete: the API accepted the request, but did not apply: ${list(check.unapplied)}. checked and applied: ${list(check.applied)}. not checked: ${list(check.unchecked)}.${hint} Do not retry the whole call; the applied fields are already saved. Event as stored now: ${JSON.stringify(formatEvent(res.data))}`,
+        }],
         isError: true,
       };
     }

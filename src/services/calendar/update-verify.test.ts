@@ -162,3 +162,68 @@ describe("calendar_update_event does not flag writes that applied", () => {
     ok(await update({ summary: "Renamed sync" }, guestInstance));
   });
 });
+
+describe("calendar_update_event skips comparisons it cannot decide", () => {
+  const ok = (r: { result: { isError?: boolean }; text: string }) => {
+    expect(r.result.isError).toBeUndefined();
+    expect(JSON.parse(r.text).id).toBeDefined();
+  };
+  const at = (dateTime: string, timeZone?: string) => ({ ...guestInstance, start: { dateTime, timeZone } });
+
+  it("a wall-clock time inside a spring-forward gap", async () => {
+    ok(await update({ start: "2026-03-08T02:30:00", timeZone: "America/New_York" }, at("2026-03-08T03:30:00-04:00", "America/New_York")));
+  });
+
+  it("an ambiguous fall-back hour, whichever occurrence Google picked", async () => {
+    ok(await update({ start: "2026-11-01T01:30:00", timeZone: "America/New_York" }, at("2026-11-01T01:30:00-05:00", "America/New_York")));
+    ok(await update({ start: "2026-11-01T01:30:00", timeZone: "America/New_York" }, at("2026-11-01T01:30:00-04:00", "America/New_York")));
+  });
+
+  it("an undecidable boundary is listed as not checked, never as applied", async () => {
+    const { result, text } = await update(
+      { start: "2026-03-08T02:30:00", timeZone: "America/New_York", location: "Room 9" },
+      at("2026-03-08T03:30:00-04:00", "America/New_York"),
+    );
+    expect(result.isError).toBe(true);
+    expect(text).toContain("did not apply: location.");
+    expect(text).toContain("checked and applied: none.");
+    expect(text).toContain("not checked: start.");
+  });
+
+  it("offset forms other than Z or ±HH:MM", async () => {
+    ok(await update({ start: "2026-10-06T19:00:00+0000", timeZone: "America/New_York" }, at("2026-10-06T15:00:00-04:00", "America/New_York")));
+    ok(await update({ start: "2026-10-07T00:00:00+05", timeZone: "America/New_York" }, at("2026-10-06T15:00:00-04:00", "America/New_York")));
+  });
+
+  it("a local time with no timeZone sent and none on the existing event", async () => {
+    ok(await update({ start: "2026-10-06T15:00:00" }, at("2026-10-06T15:00:00-07:00", "UTC"), { start: {}, end: {} }));
+  });
+
+  it("description is not compared, since Google may sanitize it", async () => {
+    ok(await update({ description: "<b>agenda</b>" }, { ...guestInstance, description: "<b>agenda</b><br>" }));
+  });
+
+  it("summary and location compare after trimming and CRLF normalization", async () => {
+    ok(await update(
+      { summary: "  Renamed\r\nsync \n", location: "\tRoom 9 " },
+      { ...guestInstance, summary: "Renamed\nsync", location: "Room 9" },
+    ));
+  });
+});
+
+describe("calendar_update_event mismatch report wording", () => {
+  it("names applied, unapplied and unchecked fields, with no hint when the organizer is absent", async () => {
+    const { organizer, ...noOrganizer } = guestInstance;
+    void organizer;
+    const { result, text } = await update(
+      { summary: "Renamed sync", start: "2026-10-06T15:00:00-04:00", description: "d", reminders: { useDefault: true }, recurrence: ["RRULE:FREQ=WEEKLY"] },
+      noOrganizer,
+    );
+    expect(result.isError).toBe(true);
+    expect(text).toContain("did not apply: start.");
+    expect(text).toContain("checked and applied: summary.");
+    expect(text).toContain("not checked: reminders, recurrence, description.");
+    expect(text).not.toMatch(/other requested fields applied/i);
+    expect(text).not.toMatch(/not this event.s organizer/);
+  });
+});
