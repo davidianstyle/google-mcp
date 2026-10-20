@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { google, calendar_v3 } from "googleapis";
-import { registerCalendarTools } from "./index.js";
+import { formatEvent, registerCalendarTools } from "./index.js";
 
 type Handler = (opts: Record<string, unknown>) => Promise<{ content: Array<{ text: string }>; isError?: boolean }>;
 
@@ -50,7 +50,8 @@ describe("calendar_update_event reports fields the API did not apply", () => {
     expect(result.isError).toBe(true);
     expect(text).toMatch(/did not apply: start, end\b/);
     expect(text).not.toMatch(/did not apply:[^.]*summary/);
-    expect(text).toMatch(/not this event's organizer/);
+    expect(text).toMatch(/This calendar's copy of the event is not the organizer's copy/);
+    expect(text).not.toMatch(/authenticated account/);
     expect(text).toContain("2026-10-06T10:00:00-04:00");
   });
 
@@ -240,9 +241,8 @@ describe("calendar_update_event notes a guest-copy-only change on success", () =
     const { result, text } = await update(input, moved);
     expect(result.isError).toBeUndefined();
     const body = JSON.parse(text);
-    expect(body.note).toMatch(/your copy only/);
-    expect(body.note).toMatch(/organizer and other guests still see the previous/);
-    expect(body.note).toContain("start, end, summary");
+    expect(body.note).toContain("This calendar's copy of the event is not the organizer's copy: any change to start, end, summary applies to this calendar's copy only; the organizer and other guests keep their own values.");
+    expect(body.note).not.toMatch(/authenticated account|previous values|your copy/);
     expect(body.id).toBe("single1");
   });
 
@@ -254,11 +254,8 @@ describe("calendar_update_event notes a guest-copy-only change on success", () =
   it("the organizer's success payload is unchanged", async () => {
     const own = { ...moved, organizer: { email: "me@example.com", self: true } };
     const { text } = await update(input, own);
-    expect(text).toBe(JSON.stringify({
-      id: own.id, summary: own.summary, description: undefined, start: own.start, end: own.end, location: undefined,
-      status: own.status, htmlLink: undefined, attendees: own.attendees, conferenceData: undefined,
-      recurrence: undefined, creator: own.creator, organizer: own.organizer,
-    }));
+    expect(JSON.parse(text).note).toBeUndefined();
+    expect(text).toBe(JSON.stringify(formatEvent(own)));
   });
 
   it("no organizer in the response, no note", async () => {
@@ -270,7 +267,35 @@ describe("calendar_update_event notes a guest-copy-only change on success", () =
 
   it("the error path keeps its own hint and adds no note", async () => {
     const { text } = await update(input, guestInstance);
-    expect(text).toMatch(/not this event's organizer/);
-    expect(text).not.toMatch(/your copy only/);
+    expect(text).toMatch(/This calendar's copy of the event is not the organizer's copy/);
+    expect(text).not.toMatch(/applies to this calendar's copy only/);
+  });
+});
+
+describe("calendar_update_event round-two coverage", () => {
+  it("an ambiguous fall-back hour in a zone at +12h or more is not flagged", async () => {
+    const at = (dateTime: string, timeZone: string) => ({ ...guestInstance, start: { dateTime, timeZone } });
+    for (const got of ["2026-04-05T02:30:00+13:00", "2026-04-05T02:30:00+12:00"]) {
+      const { result } = await update({ start: "2026-04-05T02:30:00", timeZone: "Pacific/Auckland" }, at(got, "Pacific/Auckland"));
+      expect(result.isError).toBeUndefined();
+    }
+    for (const got of ["2026-04-05T03:15:00+13:45", "2026-04-05T03:15:00+12:45"]) {
+      const { result } = await update({ start: "2026-04-05T03:15:00", timeZone: "Pacific/Chatham" }, at(got, "Pacific/Chatham"));
+      expect(result.isError).toBeUndefined();
+    }
+  });
+
+  it("a recurrence change on a guest's copy carries the note", async () => {
+    const { text } = await update({ recurrence: ["RRULE:FREQ=DAILY"] }, { ...guestInstance, recurrence: ["RRULE:FREQ=DAILY"] });
+    expect(JSON.parse(text).note).toContain("any change to recurrence applies to this calendar's copy only");
+  });
+
+  it("the tool description names every checked, unchecked and shared field", async () => {
+    let description = "";
+    registerCalendarTools({ tool: (n: string, d: string) => { if (n === "calendar_update_event") description = d; } } as never, { auth: {} as never });
+    for (const f of ["start, end, summary, location, colorId, visibility, transparency, guestsCanModify, guestsCanInviteOthers, guestsCanSeeOtherGuests",
+      "attendees, reminders, recurrence, description", "start, end, summary, location, description, recurrence"]) {
+      expect(description).toContain(f);
+    }
   });
 });

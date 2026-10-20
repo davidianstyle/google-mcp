@@ -77,7 +77,7 @@ const focusTimePropertiesSchema = z.object({
   chatStatus: z.enum(["available", "doNotDisturb"]).optional(),
 });
 
-function formatEvent(e: calendar_v3.Schema$Event): Record<string, unknown> {
+export function formatEvent(e: calendar_v3.Schema$Event): Record<string, unknown> {
   return {
     id: e.id,
     summary: e.summary,
@@ -124,13 +124,13 @@ function hasExplicitOffset(dateTime: string): boolean {
 }
 
 const LOCAL_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?$/;
-const OFFSET_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}:\d{2})$/;
 
 // Epoch seconds for a wall-clock time in an IANA zone, or undefined when it
 // doesn't name exactly one instant: a malformed string, an unknown zone, a
 // time skipped by a spring-forward gap, or a fall-back hour that occurs twice.
-// Each candidate offset (the zone's offset half a day either side) is kept
-// only if it is the offset actually in force at the instant it produces.
+// Each candidate offset (the zone's offset a day either side, which spans any
+// UTC offset up to ±14h) is kept only if it is the offset actually in force at
+// the instant it produces.
 function zonedLocalToEpoch(local: string, timeZone: string): number | undefined {
   const m = LOCAL_DATETIME.exec(local);
   if (!m) return undefined;
@@ -138,7 +138,7 @@ function zonedLocalToEpoch(local: string, timeZone: string): number | undefined 
   const offset = (t: number) => tzOffsetMs(timeZone, new Date(t));
   const instants = new Set<number>();
   try {
-    for (const probe of [wall - 12 * 3600e3, wall + 12 * 3600e3]) {
+    for (const probe of [wall - 24 * 3600e3, wall + 24 * 3600e3]) {
       const t = wall - offset(probe);
       if (offset(t) === wall - t) instants.add(t);
     }
@@ -151,7 +151,7 @@ function zonedLocalToEpoch(local: string, timeZone: string): number | undefined 
 // A timed boundary as epoch seconds. An offset-qualified value is read as-is;
 // a local one needs a zone. Any other form is undecidable.
 function toEpoch(dateTime: string, timeZone: string | null | undefined): number | undefined {
-  if (OFFSET_DATETIME.test(dateTime)) {
+  if (hasExplicitOffset(dateTime)) {
     const ms = Date.parse(dateTime);
     return Number.isNaN(ms) ? undefined : Math.floor(ms / 1000);
   }
@@ -187,7 +187,8 @@ const normalizeText = (v: unknown) => (typeof v === "string" ? v.replace(/\r\n/g
 const UNCHECKED_FIELDS = ["attendees", "reminders", "recurrence", "description"] as const;
 
 // Fields every attendee sees from the organizer's copy of an event.
-const SHARED_FIELDS = ["start", "end", "summary", "location", "description"];
+const SHARED_FIELDS = ["start", "end", "summary", "location", "description", "recurrence"];
+const CHECKED_FIELDS = ["start", "end", ...Object.keys(SCALAR_DEFAULTS)];
 
 export interface PatchCheck { applied: string[]; unapplied: string[]; unchecked: string[] }
 
@@ -396,7 +397,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     return textResult(formatEvent(res.data ));
   });
 
-  server.tool("calendar_update_event", "Update an existing calendar event. When attendees is provided, existing attendees' RSVPs (responseStatus, comment, additionalGuests) are preserved from the live event; only new attendees start with no response. The returned event is checked against the request: if a checked field (start, end, summary, location, colorId, visibility, transparency, guestsCan*) did not take effect, as happens with the time on a guest's copy of an event someone else organizes, the call returns an error listing which fields did not apply, which were checked and applied (those did apply and are saved), and which were not checked (attendees, reminders, recurrence, description). Do not blindly retry the whole call after that error: the applied fields are already saved, and resending can re-notify attendees. When the caller is a guest rather than the organizer and a shared field (start, end, summary, location, description) changed, the success response carries a note: the change is on the caller's own copy only, and the organizer and other guests still see the previous values.", {
+  server.tool("calendar_update_event", `Update an existing calendar event. When attendees is provided, existing attendees' RSVPs (responseStatus, comment, additionalGuests) are preserved from the live event; only new attendees start with no response. The returned event is checked against the request: if a checked field (${CHECKED_FIELDS.join(", ")}) did not take effect, as happens with the time on a guest's copy of an event someone else organizes, the call returns an error listing which fields did not apply, which were checked and applied (those did apply and are saved), and which were not checked (${UNCHECKED_FIELDS.join(", ")}). Do not blindly retry the whole call after that error: the applied fields are already saved, and resending can re-notify attendees. When this calendar's copy is not the organizer's copy and a shared field (${SHARED_FIELDS.join(", ")}) was sent, the success response carries a note: any change to those fields applies to this calendar's copy only, and the organizer and other guests keep their own values.`, {
     calendarId: z.string(),
     eventId: z.string(),
     summary: z.string().optional(),
@@ -471,7 +472,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     if (check.unapplied.length) {
       const list = (fields: string[]) => (fields.length ? fields.join(", ") : "none");
       const hint = res.data.organizer && !res.data.organizer.self
-        ? " The authenticated account is not this event's organizer; Google can accept an update to a guest's copy of an event without applying changes to shared fields such as its time."
+        ? " This calendar's copy of the event is not the organizer's copy; Google can accept an update to a guest's copy of an event without applying changes to shared fields such as its time."
         : "";
       return {
         content: [{
@@ -488,7 +489,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     if (res.data.organizer && !res.data.organizer.self && sharedChanged.length) {
       return textResult({
         ...formatEvent(res.data),
-        note: `The authenticated account is a guest, not this event's organizer: the change to ${sharedChanged.join(", ")} is on your copy only. The organizer and other guests still see the previous values.`,
+        note: `This calendar's copy of the event is not the organizer's copy: any change to ${sharedChanged.join(", ")} applies to this calendar's copy only; the organizer and other guests keep their own values.`,
       });
     }
     return textResult(formatEvent(res.data ));
