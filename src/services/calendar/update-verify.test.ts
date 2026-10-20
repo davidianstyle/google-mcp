@@ -272,7 +272,7 @@ describe("calendar_update_event notes a guest-copy-only change on success", () =
   });
 });
 
-describe("calendar_update_event round-two coverage", () => {
+describe("calendar_update_event verification edge cases", () => {
   it("an ambiguous fall-back hour in a zone at +12h or more is not flagged", async () => {
     const at = (dateTime: string, timeZone: string) => ({ ...guestInstance, start: { dateTime, timeZone } });
     for (const got of ["2026-04-05T02:30:00+13:00", "2026-04-05T02:30:00+12:00"]) {
