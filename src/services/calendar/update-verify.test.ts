@@ -227,3 +227,50 @@ describe("calendar_update_event mismatch report wording", () => {
     expect(text).not.toMatch(/not this event.s organizer/);
   });
 });
+
+describe("calendar_update_event notes a guest-copy-only change on success", () => {
+  const { recurringEventId, originalStartTime, ...single } = guestInstance;
+  void recurringEventId; void originalStartTime;
+  const moved = { ...single, id: "single1",
+    start: { dateTime: "2026-10-06T15:00:00-04:00", timeZone: "America/New_York" },
+    end: { dateTime: "2026-10-06T16:00:00-04:00", timeZone: "America/New_York" } };
+  const input = { summary: "Renamed sync", start: "2026-10-06T15:00:00-04:00", end: "2026-10-06T16:00:00-04:00" };
+
+  it("a guest whose shared-field change applied gets the note", async () => {
+    const { result, text } = await update(input, moved);
+    expect(result.isError).toBeUndefined();
+    const body = JSON.parse(text);
+    expect(body.note).toMatch(/your copy only/);
+    expect(body.note).toMatch(/organizer and other guests still see the previous/);
+    expect(body.note).toContain("start, end, summary");
+    expect(body.id).toBe("single1");
+  });
+
+  it("a guest changing only private fields gets no note", async () => {
+    const { text } = await update({ colorId: "5" }, { ...moved, colorId: "5" });
+    expect(JSON.parse(text).note).toBeUndefined();
+  });
+
+  it("the organizer's success payload is unchanged", async () => {
+    const own = { ...moved, organizer: { email: "me@example.com", self: true } };
+    const { text } = await update(input, own);
+    expect(text).toBe(JSON.stringify({
+      id: own.id, summary: own.summary, description: undefined, start: own.start, end: own.end, location: undefined,
+      status: own.status, htmlLink: undefined, attendees: own.attendees, conferenceData: undefined,
+      recurrence: undefined, creator: own.creator, organizer: own.organizer,
+    }));
+  });
+
+  it("no organizer in the response, no note", async () => {
+    const { organizer, ...anon } = moved;
+    void organizer;
+    const { text } = await update(input, anon);
+    expect(JSON.parse(text).note).toBeUndefined();
+  });
+
+  it("the error path keeps its own hint and adds no note", async () => {
+    const { text } = await update(input, guestInstance);
+    expect(text).toMatch(/not this event's organizer/);
+    expect(text).not.toMatch(/your copy only/);
+  });
+});

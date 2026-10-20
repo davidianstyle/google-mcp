@@ -186,6 +186,9 @@ const normalizeText = (v: unknown) => (typeof v === "string" ? v.replace(/\r\n/g
 // response isn't evidence the write was dropped.
 const UNCHECKED_FIELDS = ["attendees", "reminders", "recurrence", "description"] as const;
 
+// Fields every attendee sees from the organizer's copy of an event.
+const SHARED_FIELDS = ["start", "end", "summary", "location", "description"];
+
 export interface PatchCheck { applied: string[]; unapplied: string[]; unchecked: string[] }
 
 /**
@@ -393,7 +396,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     return textResult(formatEvent(res.data ));
   });
 
-  server.tool("calendar_update_event", "Update an existing calendar event. When attendees is provided, existing attendees' RSVPs (responseStatus, comment, additionalGuests) are preserved from the live event; only new attendees start with no response. The returned event is checked against the request: if a checked field (start, end, summary, location, colorId, visibility, transparency, guestsCan*) did not take effect, as happens with the time on a guest's copy of an event someone else organizes, the call returns an error listing which fields did not apply, which were checked and applied (those did apply and are saved), and which were not checked (attendees, reminders, recurrence, description). Do not blindly retry the whole call after that error: the applied fields are already saved, and resending can re-notify attendees.", {
+  server.tool("calendar_update_event", "Update an existing calendar event. When attendees is provided, existing attendees' RSVPs (responseStatus, comment, additionalGuests) are preserved from the live event; only new attendees start with no response. The returned event is checked against the request: if a checked field (start, end, summary, location, colorId, visibility, transparency, guestsCan*) did not take effect, as happens with the time on a guest's copy of an event someone else organizes, the call returns an error listing which fields did not apply, which were checked and applied (those did apply and are saved), and which were not checked (attendees, reminders, recurrence, description). Do not blindly retry the whole call after that error: the applied fields are already saved, and resending can re-notify attendees. When the caller is a guest rather than the organizer and a shared field (start, end, summary, location, description) changed, the success response carries a note: the change is on the caller's own copy only, and the organizer and other guests still see the previous values.", {
     calendarId: z.string(),
     eventId: z.string(),
     summary: z.string().optional(),
@@ -477,6 +480,16 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
         }],
         isError: true,
       };
+    }
+    // A guest's update to shared fields lands on the guest's own copy of the
+    // event, so the response matches the request while the organizer's copy,
+    // which everyone else sees, is unchanged.
+    const sharedChanged = [...check.applied, ...check.unchecked].filter((f) => SHARED_FIELDS.includes(f));
+    if (res.data.organizer && !res.data.organizer.self && sharedChanged.length) {
+      return textResult({
+        ...formatEvent(res.data),
+        note: `The authenticated account is a guest, not this event's organizer: the change to ${sharedChanged.join(", ")} is on your copy only. The organizer and other guests still see the previous values.`,
+      });
     }
     return textResult(formatEvent(res.data ));
   });

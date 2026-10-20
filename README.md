@@ -59,6 +59,7 @@ By default every family registers. `--families gmail,calendar` restricts the ser
 ### Calendar notes
 
 - `calendar_update_event` checks the event Google returns against the request. If a checked field (start, end, summary, location, colorId, visibility, transparency, guestsCan*) did not take effect, which happens with the time on a guest's copy of an event someone else organizes, the call returns an error that lists the fields that did not apply, the fields checked and applied (those are saved), and the fields not checked (attendees, reminders, recurrence, description). A comparison it cannot decide, such as a local time inside a DST gap or with no known timezone, is listed as not checked, never as a failure. Callers should not blindly retry the whole call after this error: the applied fields are already saved, and resending can re-notify attendees.
+- When the caller is a guest rather than the organizer, Google applies a change to start, end, summary, location or description to the guest's own copy only. The response matches the request, so `calendar_update_event` reports success but adds a `note` saying the organizer and other guests still see the previous values.
 
 ### Gmail notes
 
