@@ -4,7 +4,7 @@ import {
   decodeBase64UrlToBuffer,
   decodePartText,
   getHeader,
-  htmlToText,
+  htmlToOutgoingText,
   type EmailAttachment,
   type InlineImagePart,
 } from "./email.js";
@@ -70,17 +70,15 @@ export function buildForwardHeaderBlock(fields: ForwardHeaderFields): { text: st
  * Fills in whichever of text/html the original lacked, deriving it minimally
  * from the other. Leaves both alone when both (or neither) are present.
  *
- * The derived text/plain alternative goes through htmlToText's *uncapped*
- * form (maxLength: Infinity) — htmlToText's default 50k display cap exists
- * for a body shown to an LLM caller, not for a MIME part that's about to be
- * attached to an outgoing message; capping it here would silently truncate
- * the forwarded email's plain-text alternative and append a "[truncated: …]"
- * note into the message itself.
+ * The derived text/plain alternative comes from htmlToOutgoingText, not
+ * htmlToText: the link targets, notes and 50k display cap that htmlToText
+ * adds are for a body shown to an LLM caller, not for a MIME part that's
+ * about to be attached to an outgoing message.
  */
 export function deriveMissingBodyPart(original: { text: string; html: string }): { text: string; html: string } {
   let { text, html } = original;
   if (!html && text) html = minimalTextToHtml(text);
-  else if (!text && html) text = htmlToText(html, Infinity);
+  else if (!text && html) text = htmlToOutgoingText(html);
   return { text, html };
 }
 

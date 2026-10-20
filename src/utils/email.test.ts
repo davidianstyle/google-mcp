@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  bestBodyText,
   buildRawEmail,
   buildReplyHeaders,
   capTextLength,
   formatMessage,
+  htmlToOutgoingText,
   htmlToText,
   parseAddressList,
   type OriginalMessageHeaders,
@@ -235,7 +237,91 @@ describe("htmlToText", () => {
     const html =
       "<html><head><style>body{color:red}</style></head><body>" +
       "<script>alert(1)</script><p>Hello &amp; welcome</p><br>Line2</body></html>";
-    expect(htmlToText(html)).toBe("Hello & welcome\nLine2");
+    expect(htmlToText(html)).toBe("Hello & welcome\n\nLine2");
+  });
+
+  it("leaves out the head, comments and content that is never shown", () => {
+    const html =
+      "<html><head><title>Weekly update</title><meta name=x content=y></head><body>" +
+      "<!-- tracking -->Hi<template><p>hidden</p></template>" +
+      "<noframes><p>No frames</p></noframes><noembed><b>No embed</b></noembed> there</body></html>";
+    expect(htmlToText(html)).toBe("Hi there");
+  });
+
+  it("shows noscript content, as mail clients run without scripts", () => {
+    expect(htmlToText("Hi<noscript><p>Please enable images</p></noscript>there")).toBe("Hi\n\nPlease enable images\n\nthere");
+  });
+
+  it("keeps whitespace inside pre and collapses it elsewhere", () => {
+    expect(htmlToText("<p>a   b\n c</p><pre>x  y\n  z</pre>")).toBe("a b c\n\nx  y\n  z");
+  });
+
+  it("converts nesting up to the browser limit in full", () => {
+    expect(htmlToText("<div>".repeat(400) + "deep", Infinity)).toBe("deep");
+  });
+
+  // HTML past the parse limits is not rendered at all: the reader gets this note,
+  // bestBodyText falls back to the text/plain part, and outgoing text is empty.
+  const NOT_SHOWN = "[HTML not shown: this message's HTML is far outside what real email contains]";
+  const expectNotShown = (html: string) => {
+    const start = performance.now();
+    expect(htmlToText(html, Infinity)).toBe(NOT_SHOWN);
+    expect(bestBodyText({ text: "Plain part", html })).toBe("Plain part");
+    expect(bestBodyText({ text: "", html })).toBe(NOT_SHOWN);
+    expect(htmlToOutgoingText(html)).toBe("");
+    // Generous: the limits stop these inputs within a fraction of this.
+    expect(performance.now() - start).toBeLessThan(5000);
+  };
+
+  it("does not render HTML nested past the limit, templates included", () => {
+    expectNotShown('<p>Hello <a href="https://evil.test/">more' + "<div>".repeat(100_000) + "deep");
+    expectNotShown("Hi" + "<template>".repeat(5000));
+  });
+
+  it("does not render HTML with a tag carrying more attributes than the limit", () => {
+    // Distinct names: the tokenizer compares each new attribute with every earlier one.
+    const names = Array.from({ length: 50_000 }, (_, i) => `a${i}`).join(" ");
+    expectNotShown(`<p>Bank</p><a ${names} href="https://evil.test/">Log in</a>`);
+    expect(htmlToText(`<p ${Array.from({ length: 900 }, (_, i) => `a${i}`).join(" ")}>ok</p>`)).toBe("ok");
+    // A quote in a comment, script or attribute value cannot hide the tag from the count.
+    for (const lead of ['<!-- <a b=" -->', "<script>var s='<a b=\"';</script>"]) expectNotShown(`${lead}<p ${names}>hi</p>"`);
+    expectNotShown(`<p title="<" ${names}>hi</p>`);
+    expectNotShown(`<!-- <a b=" --><svg><style><p title="<x>" ${names}>hi</p></style></svg>"`);
+    expectNotShown(`<p>hi</p ${names}>`);
+  });
+
+  it("charges the tokenizer's attribute comparisons to the work budget", () => {
+    const names999 = Array.from({ length: 999 }, (_, i) => `a${i}`).join(" ");
+    expectNotShown(`<p>hi</p>${`</i ${names999}>`.repeat(50)}`); // under the per-tag limit, on end tags
+    expectNotShown(`<b ${names999}>x`.repeat(60)); // and on nested formatting elements
+    expect(htmlToText(`<p>hi</p>${`</i ${names999}>`.repeat(5)}`)).toBe("hi");
+  });
+
+  it("does not render HTML whose tree construction would exceed the work budget", () => {
+    // Each of these is quadratic (or deep-stack linear) in tree construction.
+    expectNotShown("<table>" + "x<img>".repeat(200_000)); // foster parenting, text and elements
+    expectNotShown("<table>" + "<img>".repeat(200_000)); // foster parenting, elements only
+    expectNotShown("<i></i>".repeat(60_000) + "<table>" + "x<!---->".repeat(60_000)); // foster parenting, text only
+    expectNotShown("<b><div>" + "x<br>".repeat(200_000) + "</b>end"); // adoption agency
+    expectNotShown("<span>".repeat(508) + "<i></i>".repeat(40_000)); // siblings at depth 508
+    expectNotShown("<span>".repeat(508) + "</x>".repeat(40_000)); // stray end tags scanning a deep stack
+    expectNotShown("x".repeat(6_000_000)); // input far larger than real mail
+  });
+
+  it("renders repeated html and body tags without merging their attributes", () => {
+    const html = Array.from({ length: 50_000 }, (_, i) => `<body a${i}>`).join("") + "<p>Hello</p>";
+    const start = performance.now();
+    expect(htmlToText(html, Infinity)).toBe("Hello");
+    expect(htmlToText(Array.from({ length: 50_000 }, (_, i) => `<html a${i}>`).join("") + "Hello", Infinity)).toBe("Hello");
+    expect(performance.now() - start).toBeLessThan(5000);
+  });
+
+  it("breaks lines at block ends and separates table cells", () => {
+    const html =
+      "<h1>Order shipped</h1><p>Your order has shipped.</p>" +
+      "<table><tr><td>Whole Milk 1 gal</td><td>1</td><td>$5.09</td></tr><tr><th>Total</th><td>$5.09</td></tr></table>" +
+      "<ul><li>One</li><li>Two</li></ul><div>Thanks, <b>Example</b>Store</div>";
+    expect(htmlToText(html)).toBe("Order shipped\n\nYour order has shipped.\n\nWhole Milk 1 gal 1 $5.09\nTotal $5.09\nOne\nTwo\nThanks, ExampleStore");
   });
 
   it("caps output length and appends a truncation note", () => {
@@ -248,6 +334,269 @@ describe("htmlToText", () => {
   it("does not truncate content within the length cap", () => {
     const text = htmlToText("<p>short</p>", 1000);
     expect(text).toBe("short");
+  });
+
+  it("keeps a link's URL after its text", () => {
+    const html = '<p><a class="btn" href="https://example.com/signup?ref=news&amp;src=mail">Sign up</a> today</p>';
+    expect(htmlToText(html)).toBe("Sign up <https://example.com/signup?ref=news&src=mail> today");
+  });
+
+  it("reads single-quoted and unquoted href values", () => {
+    expect(htmlToText("<a href='https://example.com/a'>A</a> <a href=https://example.com/b>B</a>"))
+      .toBe("A <https://example.com/a> B <https://example.com/b>");
+  });
+
+  it("shows the target even when the link text shows the same URL", () => {
+    expect(htmlToText('<a href="https://example.com/">https://example.com/</a>'))
+      .toBe("https://example.com/ <https://example.com/>");
+    expect(htmlToText('<a href="https://www.example.com/">example.com</a>')).toBe("example.com <https://www.example.com/>");
+    expect(htmlToText('<a href="https://example.com/x">Go to https://example.com/x now</a>'))
+      .toBe("Go to https://example.com/x now <https://example.com/x>");
+    expect(htmlToText('<a href="https://example.com/x">(https://example.com/x)</a>'))
+      .toBe("(https://example.com/x) <https://example.com/x>");
+    expect(htmlToText('<a href="https://EXAMPLE.com/a">example.com/a</a>')).toBe("example.com/a <https://example.com/a>");
+  });
+
+  it("keeps the URL of a link with no text", () => {
+    expect(htmlToText('<a href="https://example.com/x"><img src="https://example.com/logo.png"></a>'))
+      .toBe("<https://example.com/x>");
+    expect(htmlToText('<p>Intro</p><a href="https://example.com/x"><img></a><div><a href="https://example.com/y"><img></a></div>'))
+      .toBe("Intro\n\n<https://example.com/x>\n<https://example.com/y>");
+    expect(htmlToText('Follow us<a href="https://a.example/"><img></a><a href="https://b.example/"><img></a>today'))
+      .toBe("Follow us <https://a.example/> <https://b.example/> today");
+  });
+
+  it("drops fragment, script, and relative link targets but keeps their text", () => {
+    expect(htmlToText('<a href="#top">Top</a> <a href="javascript:void(0)">Menu</a> <a href="/local">Here</a>'))
+      .toBe("Top Menu Here");
+  });
+
+  it("reads the href attribute, not a *-href attribute before it", () => {
+    expect(htmlToText('<a data-href="https://track.example/x" href="https://example.com/y">Go</a>'))
+      .toBe("Go <https://example.com/y>");
+  });
+
+  it("still shows the target when the link text shows a different URL that merely starts with it", () => {
+    expect(htmlToText('<a href="https://example.co">https://example.com.other.test/login</a>'))
+      .toBe("https://example.com.other.test/login <https://example.co/>");
+    expect(htmlToText('<a href="https://example.com/">Unsubscribe at https://example.com/unsubscribe</a>'))
+      .toBe("Unsubscribe at https://example.com/unsubscribe <https://example.com/>");
+  });
+
+  it("decodes an entity-encoded href once", () => {
+    expect(htmlToText('<a href="&#109;&#97;&#105;&#108;&#116;&#111;&#58;help@example.com&#63;subject=x">Email us</a>'))
+      .toBe("Email us <help@example.com>");
+    expect(htmlToText('<a href="https://example.com/?q=a&amp;lt;b">Q</a>')).toBe("Q <https://example.com/?q=a&lt;b>");
+  });
+
+  it("ends an unclosed anchor at the next one, carrying it into a following block as a browser does", () => {
+    expect(htmlToText('<a href="https://a.example/">A<p>text <a href="https://b.example/">B</a>'))
+      .toBe("A <https://a.example/>\n\ntext <https://a.example/> B <https://b.example/>");
+  });
+
+  it("keeps a link's target with its text and apart from what follows", () => {
+    expect(htmlToText('Please review the <a href="https://x.test/x">deck </a>before Friday.'))
+      .toBe("Please review the deck <https://x.test/x> before Friday.");
+    expect(htmlToText('<a href="https://x.test/h">Home </a><a href="https://x.test/s">Shop </a>'))
+      .toBe("Home <https://x.test/h> Shop <https://x.test/s>");
+    expect(htmlToText('<p><a href="https://a.test/">Read the report<br></a>Unsubscribe here</p>'))
+      .toBe("Read the report <https://a.test/>\nUnsubscribe here");
+    expect(htmlToText('<a href="https://x.test/">Sign up</a>.')).toBe("Sign up <https://x.test/>.");
+  });
+
+  it("converts many unclosed anchors (each one runs the parser's adoption agency) quickly", () => {
+    const html = '<a name="x">y '.repeat(50_000);
+    const start = performance.now();
+    htmlToText(html, Infinity);
+    expect(performance.now() - start).toBeLessThan(2000);
+  });
+
+  it("does not read href= text inside another attribute's value", () => {
+    expect(htmlToText('<a title=" href=https://example.org" href="https://example.com/login">Account</a>'))
+      .toBe("Account <https://example.com/login>");
+  });
+
+  it("allows > inside a quoted attribute value", () => {
+    expect(htmlToText('<a title="a > b" href="https://example.com/x">Go</a>')).toBe("Go <https://example.com/x>");
+  });
+
+  it("shows the target when the link text differs from it only in case or scheme", () => {
+    expect(htmlToText('<a href="https://example.com/Reset?t=AbC">https://example.com/reset?t=abc</a>'))
+      .toBe("https://example.com/reset?t=abc <https://example.com/Reset?t=AbC>");
+    expect(htmlToText('<a href="https://example.com/">ftp://example.com/</a>')).toBe("ftp://example.com/ <https://example.com/>");
+  });
+
+  it("drops line breaks inside a wrapped href", () => {
+    expect(htmlToText('<a href="https://example.com/a\nb">Go</a>')).toBe("Go <https://example.com/ab>");
+  });
+
+  it("reads an unquoted href up to whitespace or the end of the tag", () => {
+    expect(htmlToText("<a href=https://example.com/track?u=1&id=2>Read more</a>"))
+      .toBe("Read more <https://example.com/track?u=1&id=2>");
+    expect(htmlToText('<a href=https://example.com/a title="x">A</a>')).toBe("A <https://example.com/a>");
+    // An unquoted value keeps a stray quote, so the next attribute is the real (first) href, as a browser reads it.
+    expect(htmlToText('<a title=x" href=https://example.org href="https://example.com/b">B</a>'))
+      .toBe("B <https://example.org/>");
+    expect(htmlToText('<a title=x"y href="https://example.com/c">C</a>')).toBe("C <https://example.com/c>");
+  });
+
+  it("shows tel and sms targets as the bare number", () => {
+    expect(htmlToText('<a href="tel:+1-555-0100">Call us</a>')).toBe("Call us <+1-555-0100>");
+    expect(htmlToText('<a href="sms:+15550100?body=hi">Text us</a>')).toBe("Text us <+15550100>");
+    expect(htmlToText('<a href="tel:+1-555-0100">+1 555 0100</a>')).toBe("+1 555 0100 <+1-555-0100>");
+    expect(htmlToText('<a href="tel:+1%20555%200100">Call us</a>')).toBe("Call us <+1 555 0100>");
+  });
+
+  it("keeps protocol-relative targets as https and calendar subscriptions as written", () => {
+    expect(htmlToText('<a href="//example.com/docs">Docs</a>')).toBe("Docs <https://example.com/docs>");
+    expect(htmlToText('<a href="webcal://example.com/cal.ics">Subscribe</a>')).toBe("Subscribe <webcal://example.com/cal.ics>");
+  });
+
+  it("shows the real target when link text split by inline tags imitates it", () => {
+    expect(htmlToText('<a href="https://evil.test/">https://accounts.example.com/<i>evil.test/</i></a>'))
+      .toBe("https://accounts.example.com/evil.test/ <https://evil.test/>");
+    expect(htmlToText('<a href="https://evil.test/">https://bank.example/<strong>evil.test</strong>/reset</a>'))
+      .toBe("https://bank.example/evil.test/reset <https://evil.test/>");
+    expect(htmlToText('<a href="mailto:attacker@evil.test">support@bank.example<span>attacker@evil.test</span></a>'))
+      .toBe("support@bank.exampleattacker@evil.test <attacker@evil.test>");
+  });
+
+  it("reads markup as a browser parses it, so stray characters and comments cannot hide a target", () => {
+    expect(htmlToText('<p>Prices <$10: <a href="https://shop.example/sale">see sale</a> today</p><p><b>Bye</b></p>'))
+      .toBe("Prices <$10: see sale <https://shop.example/sale> today\n\nBye");
+    expect(htmlToText('<a href="https://evil.test/"><!-- </a> -->https://bank.example/</a>'))
+      .toBe("https://bank.example/ <https://evil.test/>");
+    expect(htmlToText('<a title="Track > details" href="https://shop.example/t">Track</a>')).toBe("Track <https://shop.example/t>");
+  });
+
+  it("shows the outer target of nested, unclosed and oddly closed anchors", () => {
+    expect(htmlToText('<a href="https://evil.test/">https://bank.example/<a href="https://bank.example/"></a></a>'))
+      .toBe("https://bank.example/ <https://evil.test/> <https://bank.example/>");
+    expect(htmlToText('<a href="https://evil.test/">https://bank.example/login</p>'))
+      .toBe("https://bank.example/login <https://evil.test/>");
+    expect(htmlToText('<a href="https://evil.test/">https://bank.example/</a x> more'))
+      .toBe("https://bank.example/ <https://evil.test/> more");
+  });
+
+  it("resolves hrefs the way a browser does before checking the scheme", () => {
+    for (const href of ["https:evil.test/", "https:\\\\evil.test\\", "https&colon;//evil.test/", "&#104ttps://evil.test/"]) {
+      expect(htmlToText(`<a href="${href}">Bank</a>`)).toBe("Bank <https://evil.test/>");
+    }
+    expect(htmlToText('<a href="https://bank.example:pw@evil.test/x">Bank</a>')).toBe("Bank <https://evil.test/x>");
+  });
+
+  it("shows every mailto recipient, including to, cc and bcc fields", () => {
+    expect(htmlToText('<a href="mailto:?to=attacker@evil.test">Email us</a>')).toBe("Email us <attacker@evil.test>");
+    expect(htmlToText('<a href="mailto:help@example.com?bcc=attacker@evil.test&amp;subject=Hi">Email us</a>'))
+      .toBe("Email us <help@example.com, bcc: attacker@evil.test>");
+    expect(htmlToText('<a href="mailto:a+tag@example.com?cc=b%40example.com">Email us</a>'))
+      .toBe("Email us <a+tag@example.com, cc: b@example.com>");
+    expect(htmlToText('<a href="mailto:?subject=Hi">Email us</a>')).toBe("Email us");
+  });
+
+  it("reads tel, sms and mailto targets written with //", () => {
+    expect(htmlToText('<a href="tel://+15551234">Call</a>')).toBe("Call <+15551234>");
+    expect(htmlToText('<a href="tel://+1-555-1234/">Call</a>')).toBe("Call <+1-555-1234>");
+    expect(htmlToText('<a href="sms://+15551234?body=hi">Text</a>')).toBe("Text <+15551234>");
+    expect(htmlToText('<a href="mailto://help@example.com?cc=b@example.com">Mail</a>')).toBe("Mail <help@example.com, cc: b@example.com>");
+    expect(htmlToText('<a href="mailto:help@example.com?">Mail</a> <a href="tel:+15551234#">Call</a>')).toBe("Mail <help@example.com> Call <+15551234>");
+  });
+
+  it("percent-encodes characters in a URL target that could forge another target", () => {
+    expect(htmlToText('<a href="webcal:evil.test/x> <https://good.test/">Calendar</a>'))
+      .toBe("Calendar <webcal:evil.test/x%3E%20%3Chttps://good.test/>");
+  });
+
+  it("shows image-map areas as links, with their alt text as the link text", () => {
+    expect(htmlToText('<img usemap="#m"><map name="m"><area href="https://shop.test/" alt="Shop"><area href="https://help.test/" alt="Help"><area href="https://x.test/"></map>'))
+      .toBe("Shop <https://shop.test/> Help <https://help.test/> <https://x.test/>");
+  });
+
+  it("follows an SVG link's href over its xlink:href, and xlink:href alone", () => {
+    expect(htmlToText('<svg><a xlink:href="https://x.test/" href="https://y.test/"><text>Go</text></a></svg>')).toBe("Go <https://y.test/>");
+    expect(htmlToText('<svg><a xlink:href="https://x.test/"><text>Go</text></a></svg>')).toBe("Go <https://x.test/>");
+  });
+
+  it("renders outgoing text without link targets or notes", () => {
+    expect(htmlToOutgoingText('<p>See <a href="https://example.com/doc">the doc</a></p>')).toBe("See the doc");
+    expect(htmlToOutgoingText("<p>Hi</p>" + "<div>".repeat(600) + "deep")).toBe("");
+  });
+
+  it("re-encodes characters in a decoded address or number that could reorder, hide or forge it", () => {
+    expect(htmlToText('<a href="mailto:evil%E2%80%AEmoc.knab@x.test">Mail</a>')).toBe("Mail <evil%E2%80%AEmoc.knab@x.test>");
+    expect(htmlToText('<a href="mailto:a%2C%20cc%3A%20boss@bank.example">Mail</a>')).toBe("Mail <a,%20cc:%20boss@bank.example>");
+    expect(htmlToText('<a href="tel:+1%C2%85555%200100">Call</a>')).toBe("Call <+1%C2%85555 0100>");
+  });
+
+  it("shows a mailto target as the bare address", () => {
+    expect(htmlToText('<a href="mailto:help@example.com?subject=Hi">Contact support</a>'))
+      .toBe("Contact support <help@example.com>");
+    expect(htmlToText('<a href="mailto:help@example.com">help@example.com</a>')).toBe("help@example.com <help@example.com>");
+  });
+});
+
+describe("bestBodyText", () => {
+  const newsletterHtml =
+    "<p>This week we shipped a feature that syncs notes across every device, keeping both versions on conflict.</p>" +
+    "<p>We also rewrote the search index, so queries over large libraries return in a fraction of the time.</p>" +
+    '<p><a href="https://example.com/signup">Sign up</a> for the beta.</p>';
+
+  it("prefers the HTML when the text/plain part is a short stub", () => {
+    const body = bestBodyText({ text: "This email is best viewed in HTML. View it in your browser.", html: newsletterHtml });
+    expect(body).toContain("rewrote the search index");
+    expect(body).toContain("Sign up <https://example.com/signup>");
+    expect(body).not.toContain("best viewed");
+  });
+
+  it("prefers the HTML when the stub's only content is a long view-online URL", () => {
+    const text = `View online: https://example.com/view/${"a".repeat(300)}`;
+    expect(bestBodyText({ text, html: newsletterHtml })).toContain("rewrote the search index");
+  });
+
+  it("still prefers a full text/plain alternative over the HTML", () => {
+    const text =
+      "This week we shipped a feature that syncs notes across every device, keeping both versions on conflict.\n\n" +
+      "We also rewrote the search index, so queries over large libraries return in a fraction of the time.\n\n" +
+      "Sign up for the beta: https://example.com/signup";
+    expect(bestBodyText({ text, html: newsletterHtml })).toBe(text);
+  });
+
+  it("does not count attribute text as HTML prose", () => {
+    const text = "Your order has shipped and should arrive on Thursday.";
+    const html = `<p>${text}</p>` + '<a title="Track > details > status" href="https://shop.example/t">Track</a> '.repeat(6);
+    expect(bestBodyText({ text, html })).toBe(text);
+  });
+
+  it("does not count the link targets htmlToText adds when comparing", () => {
+    const text = "Call our support line any time; we answer within a minute.";
+    const html = `<p>${text}</p>` + '<a href="tel:+1%20555%200100">x</a> '.repeat(20);
+    expect(bestBodyText({ text, html })).toBe(text);
+  });
+
+  it("does not count link URLs when comparing, so long tracking links cannot outweigh the text/plain", () => {
+    const text = "See the agenda: https://example.com/agenda";
+    const html = `<p>See the <a href="https://example.com/r/${"t".repeat(400)}">agenda</a></p>`;
+    expect(bestBodyText({ text, html })).toBe(text);
+  });
+
+  it("falls back to the HTML when the text/plain part is blank", () => {
+    expect(bestBodyText({ text: "\r\n\u200c", html: '<p>Real <a href="https://example.com/r">body</a></p>' }))
+      .toBe("Real body <https://example.com/r>");
+  });
+
+  it("measures unspaced (CJK) HTML prose past a link target", () => {
+    const html = '<p><a href="https://example.com/a">こちら</a>' + "から今週の新機能をご紹介します。".repeat(20) + "</p>";
+    expect(bestBodyText({ text: "HTMLメールを表示できない場合はブラウザでご覧ください", html })).toContain("今週の新機能");
+  });
+
+  it("does not count preheader entity padding as HTML prose", () => {
+    const text = "Thanks for your order #1234. It ships tomorrow.";
+    const html = "<p>Your receipt" + "&zwnj;&nbsp;&shy;".repeat(100) + "</p><p>Thanks for your order #1234. It ships tomorrow.</p>";
+    expect(bestBodyText({ text, html })).toBe(text);
+  });
+
+  it("keeps a text/plain part when the HTML has no text of its own", () => {
+    expect(bestBodyText({ text: "Photo attached", html: '<img src="https://example.com/p.jpg">' })).toBe("Photo attached");
   });
 });
 
