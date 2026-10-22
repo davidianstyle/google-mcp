@@ -7,17 +7,31 @@ import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
 import {
   buildRawEmail,
+  buildReferencesChain,
   buildReplyHeaders,
   decodeBase64UrlToBuffer,
   encodeBase64Url,
   extractAttachments,
+  extractEmailAddress,
   bestBodyText,
   extractBody,
   formatMessage,
   getHeader,
+  htmlToText,
   type EmailAttachment,
+  type InlineImagePart,
   type OriginalMessageHeaders,
 } from "../../utils/email.js";
+import {
+  buildForwardRawEmail,
+  checkForwardRawSize,
+  estimateForwardSize,
+  largestAttachments,
+  parseForwardContent,
+  selectForwardAttachments,
+  type ForwardAttachment,
+  type ForwardHeaderFields,
+} from "../../utils/forward.js";
 import { withConcurrencyLimit } from "../../utils/concurrency.js";
 import { mapGoogleError, isInsufficientScopeError, describeMissingScopeError } from "../../utils/errors.js";
 import { ensureCacheInitialized, maybePeriodicSweep, cachePath } from "../../utils/download-cache.js";
@@ -44,6 +58,50 @@ const EXT_TO_MIME: Record<string, string> = {
   ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 };
+
+// Gmail's "metadata" format returns ONLY the headers named in metadataHeaders, so a header
+// missing from these lists comes back absent rather than erroring — a silent false negative.
+// Both lists are exported so a test can pin the entries that callers depend on.
+export const SEARCH_METADATA_HEADERS = ["From", "To", "Subject", "Date", "Message-ID"];
+export const THREAD_METADATA_HEADERS = ["From", "To", "Cc", "Date", "Subject", "Message-ID"];
+
+export type SearchHit = { id?: string | null; threadId?: string | null; snippet?: string | null; subject?: string; from?: string; date?: string; rfc822MessageId?: string };
+
+export function projectSearchHit(msg: gmail_v1.Schema$Message): SearchHit {
+  const headers = msg.payload?.headers;
+  const rfc822MessageId = getHeader(headers, "message-id");
+  return {
+    id: msg.id,
+    threadId: msg.threadId,
+    snippet: msg.snippet,
+    subject: getHeader(headers, "subject"),
+    from: getHeader(headers, "from"),
+    date: getHeader(headers, "date"),
+    ...(rfc822MessageId ? { rfc822MessageId } : {}),
+  };
+}
+
+// Per-message body snippet cap for thread reads: a whole thread can be many
+// long messages, so each is trimmed to keep the aggregate response bounded.
+const THREAD_BODY_MAX = 2000;
+export function pruneThreadMessage(msg: gmail_v1.Schema$Message): Record<string, unknown> {
+  const headers = msg.payload?.headers;
+  const rfc822MessageId = getHeader(headers, "message-id");
+  const body = extractBody(msg.payload);
+  let text = bestBodyText(body);
+  if (text.length > THREAD_BODY_MAX) text = `${text.slice(0, THREAD_BODY_MAX)}\n\n[truncated]`;
+  return {
+    id: msg.id,
+    from: getHeader(headers, "from"),
+    to: getHeader(headers, "to"),
+    cc: getHeader(headers, "cc"),
+    date: getHeader(headers, "date"),
+    subject: getHeader(headers, "subject"),
+    // Present only when Message-ID was requested — see THREAD_METADATA_HEADERS.
+    ...(rfc822MessageId ? { rfc822MessageId } : {}),
+    body: text,
+  };
+}
 
 const attachmentSchema = z.object({
   path: z.string().optional().describe("Local filesystem path to read the attachment from"),
@@ -77,6 +135,53 @@ async function resolveAttachments(attachments: AttachmentInput[] | undefined): P
 }
 
 /**
+ * Resolves one forward leaf's bytes: already-inline body.data wins (no
+ * network call needed); otherwise fetches it via attachments.get. Shared by
+ * gmail_forward_email's attachment and inline-image resolution below.
+ */
+async function resolveForwardBytes(api: gmail_v1.Gmail, messageId: string, item: ForwardAttachment): Promise<string> {
+  if (item.contentBase64) return item.contentBase64;
+  if (!item.attachmentId) return "";
+  const res = await api.users.messages.attachments.get({ userId: "me", messageId, id: item.attachmentId });
+  return decodeBase64UrlToBuffer(res.data.data || "").toString("base64");
+}
+
+/**
+ * Resolves both the inline-image and regular-attachment byte sets for a
+ * forward in one pass, fetching at most 5 attachments concurrently (the same
+ * limit used elsewhere in this file) rather than the uncapped parallelism of
+ * Promise.all. A rejection from any single fetch fails the whole forward —
+ * the original Promise.all-based resolvers had the same fail-fast behavior,
+ * and a forward missing one of its attachments isn't a forward worth sending
+ * silently.
+ */
+async function resolveForwardLeaves(
+  api: gmail_v1.Gmail,
+  messageId: string,
+  inlineItems: ForwardAttachment[],
+  attachmentItems: ForwardAttachment[]
+): Promise<{ inlineImages: InlineImagePart[]; attachments: EmailAttachment[] }> {
+  const combined = [...inlineItems, ...attachmentItems];
+  const settled = await withConcurrencyLimit(combined, 5, (item) => resolveForwardBytes(api, messageId, item));
+  const failure = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
+  if (failure) throw failure.reason;
+  const bytes = (settled as PromiseFulfilledResult<string>[]).map((r) => r.value);
+
+  const inlineImages = inlineItems.map((item, i) => ({
+    filename: item.filename,
+    mimeType: item.mimeType,
+    contentBase64: bytes[i],
+    contentId: item.contentId || "",
+  }));
+  const attachments = attachmentItems.map((item, i) => ({
+    filename: item.filename,
+    mimeType: item.mimeType,
+    contentBase64: bytes[inlineItems.length + i],
+  }));
+  return { inlineImages, attachments };
+}
+
+/**
  * Picks which sendAs entry gmail_get_signature should return: an exact
  * sendAsEmail match when one is given, otherwise the account's default
  * send-as address, falling back to the first entry if none is marked
@@ -89,6 +194,51 @@ export function pickSendAs(
 ): gmail_v1.Schema$SendAs | undefined {
   if (sendAsEmail) return sendAsList.find((s) => s.sendAsEmail === sendAsEmail);
   return sendAsList.find((s) => s.isDefault) ?? sendAsList[0];
+}
+
+/**
+ * Resolves a caller-supplied `from` (a bare address or "Name <addr>") against the
+ * account's verified send-as aliases (from users.settings.sendAs.list), returning
+ * the exact From header value to use. The match is by address only — any display
+ * name the caller supplied is ignored in favor of the verified alias's own
+ * displayName (Gmail's source of truth for how that alias should show up), falling
+ * back to the bare address when the alias has no displayName set. Throws a clear
+ * error naming the valid aliases when the address isn't one of them, so a typo or a
+ * stale/unverified address fails loudly instead of silently sending as the default.
+ */
+export function resolveFromAddress(from: string, sendAsList: gmail_v1.Schema$SendAs[]): string {
+  const addr = extractEmailAddress(from).toLowerCase();
+  // Gmail leaves a "pending" alias unverified and silently rewrites From to the
+  // default address, so treat it as unusable. The primary address carries no
+  // verificationStatus and stays valid.
+  const isPending = (s: gmail_v1.Schema$SendAs) => s.verificationStatus === "pending";
+  const match = sendAsList.find((s) => s.sendAsEmail?.toLowerCase() === addr);
+  if (match && isPending(match)) {
+    const valid = sendAsList.filter((s) => !isPending(s)).map((s) => s.sendAsEmail).filter(Boolean).join(", ");
+    throw new Error(
+      `"${from}" is a send-as alias that is still pending verification, so Gmail would silently send from the default address instead. Valid aliases: ${valid || "(none configured)"}.`
+    );
+  }
+  if (!match) {
+    const valid = sendAsList.filter((s) => !isPending(s)).map((s) => s.sendAsEmail).filter(Boolean).join(", ");
+    throw new Error(
+      `"${from}" is not a verified send-as address on this account. Valid aliases: ${valid || "(none configured)"}.`
+    );
+  }
+  return match.displayName ? `${formatDisplayName(match.displayName)} <${match.sendAsEmail}>` : match.sendAsEmail!;
+}
+
+/**
+ * Renders a display name for an address header. Names containing RFC 5322
+ * specials (or whitespace-only edge cases) must be a quoted-string, otherwise
+ * e.g. "Doe, Jane <a@b.c>" parses as two mailboxes. `"` and `\` are
+ * backslash-escaped. Non-ASCII passes through as raw UTF-8, matching how
+ * buildRawEmail's address headers treat it.
+ */
+export function formatDisplayName(name: string): string {
+  const clean = name.replace(/[\r\n]+/g, " ").trim();
+  if (!/[()<>[\]:;@\\,."]/.test(clean)) return clean;
+  return `"${clean.replace(/[\\"]/g, "\\$&")}"`;
 }
 
 const GMAIL_SETTINGS_SCOPE = "https://www.googleapis.com/auth/gmail.settings.basic";
@@ -113,7 +263,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     return cachedProfileEmail;
   }
 
-  server.tool("gmail_search_emails", "Search emails using Gmail search syntax", {
+  server.tool("gmail_search_emails", "Search emails using Gmail search syntax. Each hit includes `rfc822MessageId` (the RFC822 Message-ID header, angle brackets included) alongside the Gmail `id`, so a result can be cited or re-found across mailboxes without a second fetch.", {
     query: z.string().describe("Gmail search query (e.g., 'from:example@gmail.com')"),
     maxResults: z.number().optional().describe("Maximum number of results to return"),
     pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
@@ -124,18 +274,11 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
 
     const ids = res.data.messages;
     const settled = await withConcurrencyLimit(ids, 5, async (m) => {
-      const full = await gmail.users.messages.get({ userId: "me", id: m.id!, format: "metadata", metadataHeaders: ["From", "To", "Subject", "Date"] });
-      return {
-        id: full.data.id,
-        threadId: full.data.threadId,
-        snippet: full.data.snippet,
-        subject: getHeader(full.data.payload?.headers, "subject"),
-        from: getHeader(full.data.payload?.headers, "from"),
-        date: getHeader(full.data.payload?.headers, "date"),
-      };
+      const full = await gmail.users.messages.get({ userId: "me", id: m.id!, format: "metadata", metadataHeaders: SEARCH_METADATA_HEADERS });
+      return projectSearchHit(full.data);
     });
 
-    const messages: Array<{ id?: string | null; threadId?: string | null; snippet?: string | null; subject?: string; from?: string; date?: string }> = [];
+    const messages: SearchHit[] = [];
     const failures: Array<{ id?: string | null; error: string }> = [];
     settled.forEach((result, i) => {
       if (result.status === "fulfilled") {
@@ -152,7 +295,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     });
   });
 
-  server.tool("gmail_read_email", "Read the full content of an email", {
+  server.tool("gmail_read_email", "Read the full content of an email. Returns headers, body and attachment metadata, plus `rfc822MessageId` — the RFC822 Message-ID header, returned verbatim with its angle brackets. Unlike the Gmail `id`, it is stable across mailboxes, so it is what `rfc822msgid:` searches and hand-built In-Reply-To threading need.", {
     messageId: z.string().describe("ID of the email message to retrieve"),
   }, async ({ messageId }) => {
     const res = await api.users.messages.get({ userId: "me", id: messageId, format: "full" });
@@ -166,19 +309,45 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     htmlBody: z.string().optional().describe("HTML version of the email body"),
     cc: z.array(z.string()).optional().describe("CC recipients"),
     bcc: z.array(z.string()).optional().describe("BCC recipients"),
+    from: z.string().optional().describe("Send-as address to send from (bare address or \"Name <addr>\"), instead of the account's default address. Must be one of the account's verified send-as aliases (Gmail Settings > Accounts > Send mail as); an unverified address is rejected with the list of valid aliases."),
     mimeType: z.enum(["text/plain", "text/html", "multipart/alternative"]).optional().default("text/plain"),
     threadId: z.string().optional().describe("Thread ID to reply to"),
     inReplyTo: z.string().optional().describe("RFC822 Message-ID header value to reference (not a Gmail message id). Prefer gmail_reply_to_email, which fills this in for you."),
     attachments: z.array(attachmentSchema).optional().describe("Files to attach, each { path | content_base64, filename?, mime_type? }"),
   }, async (opts) => {
     const attachments = await resolveAttachments(opts.attachments);
-    const raw = encodeBase64Url(buildRawEmail({ ...opts, attachments }));
+    const from = await resolveFromParam(opts.from);
+    const raw = encodeBase64Url(buildRawEmail({ ...opts, from, attachments }));
     const res = await api.users.messages.send({
       userId: "me",
       requestBody: { raw, threadId: opts.threadId },
     });
     return textResult({ id: res.data.id, threadId: res.data.threadId, labelIds: res.data.labelIds });
   });
+
+  // Fetches the account's verified send-as aliases, translating the
+  // insufficient-scope case into the same actionable error gmail_get_signature uses.
+  async function listSendAs(): Promise<gmail_v1.Schema$SendAs[]> {
+    try {
+      const res = await api.users.settings.sendAs.list({ userId: "me" });
+      return res.data.sendAs || [];
+    } catch (error) {
+      if (isInsufficientScopeError(error)) {
+        throw new Error(describeMissingScopeError(GMAIL_SETTINGS_SCOPE, { accountSlug: ctx.accountSlug }));
+      }
+      throw error;
+    }
+  }
+
+  // Resolves an optional `from` tool param against the account's verified send-as
+  // aliases into the exact From header value, or undefined when `from` is omitted
+  // (in which case the message sends/drafts as the account's default address,
+  // unchanged from prior behavior).
+  async function resolveFromParam(from: string | undefined): Promise<string | undefined> {
+    if (!from) return undefined;
+    const sendAsList = await listSendAs();
+    return resolveFromAddress(from, sendAsList);
+  }
 
   server.tool("gmail_draft_email", "Create an email draft", {
     to: z.array(z.string()).describe("Recipient email addresses"),
@@ -187,13 +356,15 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     htmlBody: z.string().optional().describe("HTML version of the email body"),
     cc: z.array(z.string()).optional().describe("CC recipients"),
     bcc: z.array(z.string()).optional().describe("BCC recipients"),
+    from: z.string().optional().describe("Send-as address to draft from (bare address or \"Name <addr>\"), instead of the account's default address. Must be one of the account's verified send-as aliases (Gmail Settings > Accounts > Send mail as); an unverified address is rejected with the list of valid aliases."),
     mimeType: z.enum(["text/plain", "text/html", "multipart/alternative"]).optional().default("text/plain"),
     threadId: z.string().optional().describe("Thread ID to reply to"),
     inReplyTo: z.string().optional().describe("RFC822 Message-ID header value being replied to (not a Gmail message id)"),
     attachments: z.array(attachmentSchema).optional().describe("Files to attach, each { path | content_base64, filename?, mime_type? }"),
   }, async (opts) => {
     const attachments = await resolveAttachments(opts.attachments);
-    const raw = encodeBase64Url(buildRawEmail({ ...opts, attachments }));
+    const from = await resolveFromParam(opts.from);
+    const raw = encodeBase64Url(buildRawEmail({ ...opts, from, attachments }));
     const res = await api.users.drafts.create({
       userId: "me",
       requestBody: { message: { raw, threadId: opts.threadId } },
@@ -205,6 +376,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     messageId: z.string().describe("Gmail API id of the message being replied to (e.g. from gmail_search_emails)"),
     body: z.string().describe("Reply body (plain text)"),
     htmlBody: z.string().optional().describe("HTML version of the reply body"),
+    from: z.string().optional().describe("Send-as address to reply from (bare address or \"Name <addr>\"), instead of the account's default address. Must be one of the account's verified send-as aliases (Gmail Settings > Accounts > Send mail as); an unverified address is rejected with the list of valid aliases."),
     mimeType: z.enum(["text/plain", "text/html", "multipart/alternative"]).optional().default("text/plain"),
     replyAll: z.boolean().optional().default(false).describe("Reply to the sender plus all other recipients (To+Cc), excluding yourself. Default false replies only to the sender."),
     cc: z.array(z.string()).optional().describe("Extra CC recipients to add on top of those computed for the reply"),
@@ -226,7 +398,12 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       to: getHeader(headers, "to"),
       cc: getHeader(headers, "cc"),
     };
-    const selfEmail = opts.replyAll ? await getSelfEmail() : undefined;
+    const from = await resolveFromParam(opts.from);
+    // Exclude both the primary address and the alias we're replying from, so a
+    // reply-all sent as an alias doesn't CC that alias.
+    const selfEmail = opts.replyAll
+      ? [await getSelfEmail(), from ? from.match(/<([^<>]+)>\s*$/)?.[1] ?? from : undefined].filter((a): a is string => !!a)
+      : undefined;
     const reply = buildReplyHeaders(originalHeaders, { replyAll: opts.replyAll, selfEmail });
     const cc = [...reply.cc, ...(opts.cc || [])];
     const attachments = await resolveAttachments(opts.attachments);
@@ -238,6 +415,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       subject: reply.subject,
       body: opts.body,
       htmlBody: opts.htmlBody,
+      from,
       mimeType: opts.mimeType,
       inReplyTo: reply.inReplyTo || undefined,
       references: reply.references || undefined,
@@ -248,6 +426,108 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       requestBody: { raw, threadId: original.data.threadId || undefined },
     });
     return textResult({ id: res.data.id, threadId: res.data.threadId, to: reply.to, cc, subject: reply.subject });
+  });
+
+  server.tool("gmail_forward_email", "Forward an existing email, mirroring Gmail's web Forward button: preserves the original text/plain and text/html bodies, inline (cid:) images, and attachments, and keeps the forward in the original message's thread. Use this instead of reading the body yourself and re-sending it.", {
+    messageId: z.string().describe("Gmail API id of the message to forward (e.g. from gmail_search_emails)"),
+    to: z.array(z.string()).describe("Recipient email addresses"),
+    cc: z.array(z.string()).optional().describe("CC recipients"),
+    bcc: z.array(z.string()).optional().describe("BCC recipients"),
+    note: z.string().optional().describe("Plain-text note to add above the forwarded message, your own words introducing it"),
+    includeAttachments: z.boolean().optional().default(true).describe("Carry the original's regular attachments along. Inline (cid:) images are always kept regardless — they're part of the rendered body, not an optional extra."),
+    includeSignature: z.boolean().optional().default(true).describe("Insert the default send-as signature (see gmail_get_signature) after the note and before the forwarded-message block, as Gmail's web UI does."),
+    asDraft: z.boolean().optional().default(false).describe("Create a draft instead of sending immediately, so the forward can be reviewed first."),
+  }, async ({ messageId, to, cc, bcc, note, includeAttachments, includeSignature, asDraft }) => {
+    const original = await api.users.messages.get({ userId: "me", id: messageId, format: "full" });
+    const headers = original.data.payload?.headers;
+
+    const originalHeaderFields: ForwardHeaderFields = {
+      from: getHeader(headers, "from"),
+      date: getHeader(headers, "date"),
+      subject: getHeader(headers, "subject"),
+      to: getHeader(headers, "to"),
+      cc: getHeader(headers, "cc") || undefined,
+    };
+    const messageIdHeader = getHeader(headers, "message-id");
+    const references = getHeader(headers, "references");
+
+    const parsed = parseForwardContent(original.data.payload);
+    const selected = selectForwardAttachments(parsed, includeAttachments);
+
+    // Cheap pre-download size estimate from Gmail's already-known body.size
+    // on each selected part, before fetching a single attachment byte — a
+    // forward that's already way over the limit shouldn't cost a multi-MB
+    // download just to be refused afterward.
+    const selectedParts = [...selected.inlineImages, ...selected.attachments];
+    const bodyBytes = Buffer.byteLength(parsed.text, "utf-8") + Buffer.byteLength(parsed.html, "utf-8");
+    const estimate = estimateForwardSize(selectedParts, bodyBytes);
+    if (!estimate.ok) {
+      return textResult({
+        error: `Forward is too large to send: an estimated ${estimate.estimatedBytes} bytes, over Gmail's ${estimate.limitBytes}-byte send limit, before even fetching attachment bytes.`,
+        estimatedBytes: estimate.estimatedBytes,
+        limitBytes: estimate.limitBytes,
+        largestAttachments: largestAttachments(selectedParts.map((a) => ({ filename: a.filename, size: a.size }))),
+        suggestion: "Retry with includeAttachments:false to drop regular attachments (inline images are always kept, since they're part of the body).",
+      });
+    }
+
+    // Only fetch bytes for what we're actually keeping — a dropped attachment
+    // (includeAttachments:false) never costs a network round trip.
+    const { inlineImages, attachments } = await resolveForwardLeaves(api, messageId, selected.inlineImages, selected.attachments);
+
+    let signature: { text: string; html: string } | undefined;
+    let signatureWarning: string | undefined;
+    if (includeSignature) {
+      try {
+        const sendAsRes = await api.users.settings.sendAs.list({ userId: "me" });
+        const target = pickSendAs(sendAsRes.data.sendAs || []);
+        // Uncapped: a signature is never long enough to need the 50k display
+        // cap, but htmlToText's truncation note has no business ending up
+        // inside an outgoing message if it somehow were.
+        if (target?.signature) signature = { html: target.signature, text: htmlToText(target.signature, Infinity) };
+      } catch (err) {
+        // The signature is a nice-to-have on a forward, not a requirement —
+        // a lookup failure shouldn't block it, but the caller is told it was skipped.
+        signatureWarning = `Signature omitted: lookup failed (${err instanceof Error ? err.message : String(err)}).`;
+      }
+    }
+
+    const raw = buildForwardRawEmail({
+      to,
+      cc,
+      bcc,
+      originalSubject: originalHeaderFields.subject,
+      originalHeaderFields,
+      note,
+      signature,
+      originalBody: { text: parsed.text, html: parsed.html },
+      inlineImages,
+      attachments,
+      inReplyTo: messageIdHeader || undefined,
+      references: messageIdHeader ? buildReferencesChain(references, messageIdHeader) : undefined,
+    });
+
+    const sizeCheck = checkForwardRawSize(raw);
+    if (!sizeCheck.ok) {
+      const biggest = largestAttachments(selectedParts.map((a) => ({ filename: a.filename, size: a.size })));
+      return textResult({
+        error: `Forward is too large to send: the MIME message is ${sizeCheck.totalBytes} bytes, over Gmail's ${sizeCheck.limitBytes}-byte send limit.`,
+        totalBytes: sizeCheck.totalBytes,
+        limitBytes: sizeCheck.limitBytes,
+        largestAttachments: biggest,
+        suggestion: "Retry with includeAttachments:false to drop regular attachments (inline images are always kept, since they're part of the body).",
+      });
+    }
+
+    const warnings = [signatureWarning, ...parsed.warnings].filter((w): w is string => !!w);
+    const encodedRaw = encodeBase64Url(raw);
+    const threadId = original.data.threadId || undefined;
+    if (asDraft) {
+      const res = await api.users.drafts.create({ userId: "me", requestBody: { message: { raw: encodedRaw, threadId } } });
+      return textResult({ draftId: res.data.id, messageId: res.data.message?.id, threadId: res.data.message?.threadId, ...(warnings.length && { warning: warnings.join(" ") }) });
+    }
+    const res = await api.users.messages.send({ userId: "me", requestBody: { raw: encodedRaw, threadId } });
+    return textResult({ id: res.data.id, threadId: res.data.threadId, ...(warnings.length && { warning: warnings.join(" ") }) });
   });
 
   server.tool("gmail_modify_email", "Modify email labels (add/remove)", {
@@ -449,26 +729,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     return textResult({ path, size: buffer.byteLength });
   });
 
-  // Per-message body snippet cap for thread reads: a whole thread can be many
-  // long messages, so each is trimmed to keep the aggregate response bounded.
-  const THREAD_BODY_MAX = 2000;
-  function pruneThreadMessage(msg: gmail_v1.Schema$Message): Record<string, unknown> {
-    const headers = msg.payload?.headers;
-    const body = extractBody(msg.payload);
-    let text = bestBodyText(body);
-    if (text.length > THREAD_BODY_MAX) text = `${text.slice(0, THREAD_BODY_MAX)}\n\n[truncated]`;
-    return {
-      id: msg.id,
-      from: getHeader(headers, "from"),
-      to: getHeader(headers, "to"),
-      cc: getHeader(headers, "cc"),
-      date: getHeader(headers, "date"),
-      subject: getHeader(headers, "subject"),
-      body: text,
-    };
-  }
-
-  server.tool("gmail_read_thread", "Read an entire email thread (conversation) at once — every message's headers and a trimmed body — given a thread id. Use this instead of gmail_read_email when you need the full back-and-forth context of a conversation.", {
+  server.tool("gmail_read_thread", "Read an entire email thread (conversation) at once — every message's headers and a trimmed body — given a thread id, each with its `rfc822MessageId`. Use this instead of gmail_read_email when you need the full back-and-forth context of a conversation.", {
     threadId: z.string().describe("Gmail thread id (the threadId field on any message in the thread)"),
     format: z.enum(["full", "metadata"]).optional().default("full").describe("full includes trimmed message bodies; metadata returns headers only"),
   }, async ({ threadId, format }) => {
@@ -476,7 +737,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       userId: "me",
       id: threadId,
       format,
-      ...(format === "metadata" ? { metadataHeaders: ["From", "To", "Cc", "Date", "Subject"] } : {}),
+      ...(format === "metadata" ? { metadataHeaders: THREAD_METADATA_HEADERS } : {}),
     });
     return textResult({
       threadId: res.data.id,
@@ -566,17 +827,8 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
   server.tool("gmail_get_signature", "Get the real Gmail signature configured in Gmail's UI (Settings > General > Signature), as verbatim HTML — not reconstructed or guessed. Use this before drafting/sending mail that should carry the user's signature, since gmail_draft_email/gmail_send_email do not inject it automatically (the Gmail API only sends the MIME it's given; the signature is normally added client-side by the Gmail web/app UI). Returns the default send-as address's signature unless sendAsEmail is given. Works with the existing gmail.modify grant — no additional OAuth scope is required (verified live against a token carrying no gmail.settings.basic). Google's reference docs list gmail.settings.basic for this endpoint and it enforces more loosely than that; if enforcement ever tightens, the tool returns a message naming the missing scope and the re-auth step, and retrying will not help.", {
     sendAsEmail: z.string().optional().describe("Specific send-as address to read the signature for, instead of the account's default send-as address"),
   }, async ({ sendAsEmail }) => {
-    let res;
-    try {
-      res = await api.users.settings.sendAs.list({ userId: "me" });
-    } catch (error) {
-      if (isInsufficientScopeError(error)) {
-        throw new Error(describeMissingScopeError(GMAIL_SETTINGS_SCOPE, { accountSlug: ctx.accountSlug }));
-      }
-      throw error;
-    }
-
-    const target = pickSendAs(res.data.sendAs || [], sendAsEmail);
+    const sendAsList = await listSendAs();
+    const target = pickSendAs(sendAsList, sendAsEmail);
     if (!target) {
       return textResult({
         error: sendAsEmail ? `No send-as address found matching ${sendAsEmail}.` : "No send-as addresses configured on this account.",

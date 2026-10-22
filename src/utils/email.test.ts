@@ -28,6 +28,22 @@ describe("buildRawEmail header hardening", () => {
     expect(subjectLine).toContain("Bcc: attacker@evil.com");
   });
 
+  it("omits the From header when opts.from is not supplied (unchanged default behavior)", () => {
+    const raw = buildRawEmail({ to: ["a@b.com"], subject: "test", body: "hi" });
+    expect(raw.split("\r\n").some((l) => /^From:/i.test(l))).toBe(false);
+  });
+
+  it("sets the From header verbatim when opts.from is supplied", () => {
+    const raw = buildRawEmail({
+      to: ["a@b.com"],
+      subject: "test",
+      body: "hi",
+      from: "Team Alias <alias@example.com>",
+    });
+    const fromLine = raw.split("\r\n").find((l) => l.startsWith("From:"));
+    expect(fromLine).toBe("From: Team Alias <alias@example.com>");
+  });
+
   it("RFC 2047 encodes a non-ASCII subject", () => {
     const raw = buildRawEmail({ to: ["a@b.com"], subject: "Hello 🎉 World", body: "hi" });
     const subjectLine = raw.split("\r\n").find((l) => l.startsWith("Subject:"));
@@ -193,6 +209,16 @@ describe("buildReplyHeaders", () => {
     expect(r.cc).toEqual(["carol@example.com", "dave@example.com"]);
   });
 
+  it("reply-all drops every self address when selfEmail is a list", () => {
+    const r = buildReplyHeaders(original, { replyAll: true, selfEmail: ["other@example.com", "ME@example.com"] });
+    expect(r.cc).toEqual(["carol@example.com", "dave@example.com"]);
+    const r2 = buildReplyHeaders(
+      { ...original, cc: "alias@example.com, dave@example.com" },
+      { replyAll: true, selfEmail: ["me@example.com", "alias@example.com"] }
+    );
+    expect(r2.cc).toEqual(["carol@example.com", "dave@example.com"]);
+  });
+
   it("does not double-prefix a subject that already starts with Re:", () => {
     const r = buildReplyHeaders({ ...original, subject: "RE: Project update" });
     expect(r.subject).toBe("RE: Project update");
@@ -338,5 +364,49 @@ describe("formatMessage body capping", () => {
       },
     };
     expect(formatMessage(msg).body).toBe("short body");
+  });
+});
+
+describe("formatMessage rfc822MessageId", () => {
+  const withHeaders = (headers: { name: string; value: string }[]) => ({
+    id: "m1",
+    payload: {
+      mimeType: "text/plain",
+      headers,
+      body: { data: Buffer.from("body").toString("base64url") },
+    },
+  });
+
+  it("returns the RFC822 Message-ID header verbatim, angle brackets included", () => {
+    const msg = withHeaders([
+      { name: "Subject", value: "hi" },
+      { name: "Message-ID", value: "<CAB=abc123@mail.gmail.com>" },
+    ]);
+    expect(formatMessage(msg).rfc822MessageId).toBe("<CAB=abc123@mail.gmail.com>");
+  });
+
+  it("matches the header case-insensitively", () => {
+    const msg = withHeaders([{ name: "message-id", value: "<lower@example.com>" }]);
+    expect(formatMessage(msg).rfc822MessageId).toBe("<lower@example.com>");
+  });
+
+  it("omits the key entirely when the header is absent", () => {
+    const formatted = formatMessage(withHeaders([{ name: "Subject", value: "no msgid" }]));
+    expect("rfc822MessageId" in formatted).toBe(false);
+  });
+
+  it("omits the key when the header is present but empty", () => {
+    const formatted = formatMessage(withHeaders([{ name: "Message-ID", value: "" }]));
+    expect("rfc822MessageId" in formatted).toBe(false);
+  });
+
+  // Relayed and forwarded mail can carry more than one Message-ID. getHeader takes the first;
+  // this pins that first-wins behavior so a change to it is deliberate, not accidental.
+  it("takes the first Message-ID when a relayed message carries several", () => {
+    const msg = withHeaders([
+      { name: "Message-ID", value: "<original@sender.example>" },
+      { name: "Message-ID", value: "<rewritten@relay.example>" },
+    ]);
+    expect(formatMessage(msg).rfc822MessageId).toBe("<original@sender.example>");
   });
 });

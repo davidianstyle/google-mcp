@@ -46,6 +46,33 @@ export function getHeader(headers: gmail_v1.Schema$MessagePartHeader[] | undefin
   return headers?.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value || "";
 }
 
+/** Extracts the charset parameter from a Content-Type header value (e.g. 'text/plain; charset="iso-8859-1"'), if present. */
+function extractCharset(contentType: string): string | undefined {
+  const m = /charset\s*=\s*"?([^;"]+)"?/i.exec(contentType);
+  return m ? m[1].trim() : undefined;
+}
+
+/**
+ * Decodes a MIME part's base64url body data as text, honoring the part's own
+ * Content-Type charset parameter (e.g. a non-UTF-8 sender like iso-8859-1)
+ * via TextDecoder, then returns a normal JS string (UTF-8 internally, as all
+ * JS strings are). Falls back to plain UTF-8 decoding when the part declares
+ * no charset, declares utf-8, or names a charset TextDecoder doesn't
+ * recognize.
+ */
+export function decodePartText(data: string, headers: gmail_v1.Schema$MessagePartHeader[] | undefined): string {
+  const buf = decodeBase64UrlToBuffer(data);
+  const charset = extractCharset(getHeader(headers, "content-type"));
+  if (charset && !/^utf-?8$/i.test(charset)) {
+    try {
+      return new TextDecoder(charset).decode(buf);
+    } catch {
+      // Unrecognized/unsupported charset label -> fall back to UTF-8 below.
+    }
+  }
+  return buf.toString("utf-8");
+}
+
 /** Strips CR/LF out of a header value so it can't inject additional header lines (or a body separator). */
 function sanitizeHeaderValue(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim();
@@ -145,6 +172,41 @@ function renderAttachmentPart(att: EmailAttachment): string {
   );
 }
 
+/** An inline image part (e.g. a forwarded `<img src="cid:...">`): an attachment plus the Content-ID header that cid: references in the HTML body point at. */
+export interface InlineImagePart extends EmailAttachment {
+  /** RFC 2392 Content-ID header value. Normalized to include the angle brackets regardless of how it was supplied. */
+  contentId: string;
+}
+
+/** Wraps a bare id in angle brackets if it doesn't already have them, since RFC 2392 Content-ID values are always delimited. */
+function normalizeContentId(id: string): string {
+  const trimmed = sanitizeHeaderValue(id);
+  if (!trimmed) return trimmed;
+  return trimmed.startsWith("<") ? trimmed : `<${trimmed}>`;
+}
+
+/** The MIME type of the "root" body part that a multipart/related wrapper would contain — text/html or multipart/alternative when there's an HTML body, text/plain otherwise. Used for RFC 2387's required `type` parameter. */
+function rootPartMimeType(opts: { htmlBody?: string; mimeType?: string }): string {
+  if (opts.htmlBody && opts.mimeType === "multipart/alternative") return "multipart/alternative";
+  if (opts.htmlBody || opts.mimeType === "text/html") return "text/html";
+  return "text/plain";
+}
+
+/** Renders one inline image as a base64 MIME part with Content-ID + Content-Disposition: inline, so cid: references in the HTML body resolve. */
+function renderInlineImagePart(img: InlineImagePart): string {
+  const filename = sanitizeHeaderValue(img.filename).replace(/"/g, "");
+  const mimeType = sanitizeHeaderValue(img.mimeType) || "application/octet-stream";
+  const contentId = normalizeContentId(img.contentId);
+  const body = wrapBase64(img.contentBase64.replace(/\s+/g, ""));
+  return (
+    `Content-Type: ${mimeType}${filename ? `; name="${filename}"` : ""}\r\n` +
+    `Content-Transfer-Encoding: base64\r\n` +
+    `Content-ID: ${contentId}\r\n` +
+    `Content-Disposition: inline${filename ? `; filename="${filename}"` : ""}\r\n\r\n` +
+    body
+  );
+}
+
 export function buildRawEmail(opts: {
   to: string[];
   subject: string;
@@ -157,6 +219,8 @@ export function buildRawEmail(opts: {
   references?: string;
   mimeType?: string;
   attachments?: EmailAttachment[];
+  /** Inline (cid:) images referenced from htmlBody. Wraps the body part in multipart/related, Gmail's own shape for this. */
+  inlineImages?: InlineImagePart[];
 }): string {
   const headers: string[] = [];
 
@@ -174,19 +238,37 @@ export function buildRawEmail(opts: {
 
   const bodyPart = renderBodyPart(opts);
 
-  // With attachments, wrap the body part + each attachment in multipart/mixed.
-  // The "mixed_"/"alt_" boundary prefixes contain "_" (not in the base64
-  // alphabet), so a boundary delimiter can never collide with encoded content.
+  // Inline images wrap the body part in multipart/related so cid: references
+  // in the HTML keep resolving. Skipped entirely when there are none, so the
+  // no-inline-images path (every existing caller) is untouched.
+  const contentPart = opts.inlineImages?.length
+    ? (() => {
+        const boundary = `related_${Date.now()}`;
+        const parts = [bodyPart, ...opts.inlineImages!.map(renderInlineImagePart)];
+        // RFC 2387 requires the `type` parameter on multipart/related, naming
+        // the MIME type of the root (first) body part.
+        const rootType = rootPartMimeType(opts);
+        return (
+          `Content-Type: multipart/related; boundary="${boundary}"; type="${rootType}"\r\n\r\n` +
+          parts.map((p) => `--${boundary}\r\n${p}`).join("\r\n") +
+          `\r\n--${boundary}--`
+        );
+      })()
+    : bodyPart;
+
+  // With attachments, wrap the content part + each attachment in multipart/mixed.
+  // The "mixed_"/"alt_"/"related_" boundary prefixes contain "_" (not in the
+  // base64 alphabet), so a boundary delimiter can never collide with encoded content.
   if (opts.attachments?.length) {
     const boundary = `mixed_${Date.now()}`;
     headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
-    const parts = [bodyPart, ...opts.attachments.map(renderAttachmentPart)];
+    const parts = [contentPart, ...opts.attachments.map(renderAttachmentPart)];
     const body = parts.map((p) => `--${boundary}\r\n${p}`).join("\r\n") + `\r\n--${boundary}--`;
     return headers.join("\r\n") + "\r\n\r\n" + body;
   }
 
-  // No attachments: the body part's Content-* headers sit at the message top level.
-  return headers.join("\r\n") + "\r\n" + bodyPart;
+  // No attachments: the content part's Content-* headers sit at the message top level.
+  return headers.join("\r\n") + "\r\n" + contentPart;
 }
 
 /** RFC 822 headers of the message being replied to (values as returned by Gmail's metadata format). */
@@ -250,18 +332,20 @@ export function parseAddressList(headerValue: string): string[] {
  */
 export function buildReplyHeaders(
   original: OriginalMessageHeaders,
-  opts: { replyAll?: boolean; selfEmail?: string } = {}
+  opts: { replyAll?: boolean; selfEmail?: string | string[] } = {}
 ): ReplyHeaders {
   const to = parseAddressList(original.from);
   const senderLower = new Set(to.map((a) => a.toLowerCase()));
-  const selfLower = opts.selfEmail?.toLowerCase();
+  const selfLower = new Set(
+    [opts.selfEmail ?? []].flat().map((a) => a.toLowerCase())
+  );
 
   const cc: string[] = [];
   if (opts.replyAll) {
     const seen = new Set<string>();
     for (const addr of [...parseAddressList(original.to), ...parseAddressList(original.cc)]) {
       const lower = addr.toLowerCase();
-      if (lower === selfLower) continue; // don't reply to yourself
+      if (selfLower.has(lower)) continue; // don't reply to yourself
       if (senderLower.has(lower)) continue; // already in To
       if (seen.has(lower)) continue;
       seen.add(lower);
@@ -272,11 +356,20 @@ export function buildReplyHeaders(
   const trimmedSubject = original.subject.trim();
   const subject = /^re:/i.test(trimmedSubject) ? trimmedSubject : `Re: ${trimmedSubject}`;
 
-  const references = original.references
-    ? `${original.references.trim()} ${original.messageIdHeader}`.trim()
-    : original.messageIdHeader;
+  const references = buildReferencesChain(original.references, original.messageIdHeader);
 
   return { to, cc, subject, inReplyTo: original.messageIdHeader, references };
+}
+
+/**
+ * Extends a References chain with the message being threaded off of: appends
+ * messageIdHeader to the original References header, or falls back to just
+ * messageIdHeader when there was no prior chain (the first reply/forward in
+ * a thread). Shared by buildReplyHeaders and gmail_forward_email so both
+ * tools thread identically.
+ */
+export function buildReferencesChain(originalReferences: string, messageIdHeader: string): string {
+  return originalReferences ? `${originalReferences.trim()} ${messageIdHeader}`.trim() : messageIdHeader;
 }
 
 export interface AttachmentInfo {
@@ -398,9 +491,15 @@ export function formatMessage(msg: gmail_v1.Schema$Message): Record<string, unkn
   const headers = msg.payload?.headers;
   const body = extractBody(msg.payload);
   const attachments = extractAttachments(msg.payload);
+  const rfc822MessageId = getHeader(headers, "message-id");
   return {
     id: msg.id,
     threadId: msg.threadId,
+    // The RFC822 Message-ID header, grouped with the other identifiers. Unlike the Gmail
+    // `id` above it is stable across mailboxes, so callers use it to cite a message
+    // (`rfc822msgid:` searches) and to thread replies by hand. Omitted rather than returned
+    // empty when absent, as some drafts have no Message-ID until they are sent.
+    ...(rfc822MessageId ? { rfc822MessageId } : {}),
     labelIds: msg.labelIds,
     snippet: msg.snippet,
     subject: getHeader(headers, "subject"),

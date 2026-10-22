@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { calendar_v3 } from "googleapis";
-import { formatEventForList } from "./index.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+import { google, calendar_v3 } from "googleapis";
+import { formatEventForList, registerCalendarTools } from "./index.js";
 
 describe("formatEventForList", () => {
   const baseEvent: calendar_v3.Schema$Event = {
@@ -64,5 +65,147 @@ describe("formatEventForList", () => {
   it("handles an event with no attendees", () => {
     const result = formatEventForList({ ...baseEvent, attendees: undefined }, false);
     expect(result.attendees).toBeUndefined();
+  });
+});
+
+const ATTENDEE_KEYS = [
+  "additionalGuests", "comment", "displayName", "email", "id",
+  "optional", "organizer", "resource", "responseStatus", "self",
+] as const;
+// Compile-time: fails to typecheck if Schema$EventAttendee gains a key missing from ATTENDEE_KEYS.
+type MissingKeys = Exclude<keyof calendar_v3.Schema$EventAttendee, (typeof ATTENDEE_KEYS)[number]>;
+const _exhaustive: [MissingKeys] extends [never] ? true : never = true;
+void _exhaustive;
+
+afterEach(() => { vi.restoreAllMocks(); });
+
+describe("calendar attendee schema (create/update)", () => {
+  type Handler = (opts: Record<string, unknown>) => Promise<unknown>;
+  const setup = async () => {
+    const patch = vi.fn().mockResolvedValue({ data: { id: "evt1" } });
+    const get = vi.fn().mockResolvedValue({ data: { attendees: [] } });
+    vi.spyOn(google, "calendar").mockReturnValue({ events: { patch, get } } as never);
+    const tools = new Map<string, { shape: z.ZodRawShape; handler: Handler }>();
+    const server = { tool: (name: string, _d: string, shape: z.ZodRawShape, handler: Handler) => { tools.set(name, { shape, handler }); } };
+    registerCalendarTools(server as never, { auth: {} as never });
+    return { patch, get, tools };
+  };
+
+  // Shape of calendar_get_event output (Google's raw attendee objects).
+  const readAttendees = [
+    { email: "a@example.com", displayName: "A", responseStatus: "accepted", self: true, organizer: true, id: "123" },
+    { email: "b@example.com", optional: true, responseStatus: "needsAction", comment: "maybe", additionalGuests: 2 },
+    { email: "room@example.com", resource: true, responseStatus: "accepted" },
+  ];
+
+  const forwarded = [
+    { email: "a@example.com", displayName: "A" },
+    { email: "b@example.com", optional: true },
+    { email: "room@example.com", resource: true },
+  ];
+
+  it("update_event accepts get_event-shaped attendees and forwards only organizer-controlled fields", async () => {
+    const { patch, tools } = await setup();
+    const t = tools.get("calendar_update_event")!;
+    const parsed = z.object(t.shape).parse({ calendarId: "primary", eventId: "evt1", attendees: readAttendees });
+    await t.handler(parsed);
+    expect(patch.mock.calls[0][0].requestBody.attendees).toEqual(forwarded);
+  });
+
+  it("update_event accepts optional on an attendee", async () => {
+    const { patch, tools } = await setup();
+    const t = tools.get("calendar_update_event")!;
+    const parsed = z.object(t.shape).parse({ calendarId: "primary", eventId: "evt1", attendees: [{ email: "b@example.com", optional: true }] });
+    await t.handler(parsed);
+    expect(patch.mock.calls[0][0].requestBody.attendees).toEqual([{ email: "b@example.com", optional: true }]);
+  });
+
+  it("create_event and update_event use one identical attendee schema covering every EventAttendee key", async () => {
+    const { tools } = await setup();
+    const elementOf = (name: string) => {
+      const field = tools.get(name)!.shape.attendees as z.ZodOptional<z.ZodArray<z.ZodObject<z.ZodRawShape>>>;
+      return field.unwrap().element;
+    };
+    const c = elementOf("calendar_create_event");
+    const u = elementOf("calendar_update_event");
+    expect(c).toBe(u);
+    expect(Object.keys(c.shape).sort()).toEqual([...ATTENDEE_KEYS].sort());
+    expect(Object.keys(u.shape).sort()).toEqual([...ATTENDEE_KEYS].sort());
+    // Google's `T | null` typings: round-trip-only fields accept null.
+    expect(c.safeParse({ email: "a@example.com", responseStatus: null, comment: null, additionalGuests: null, id: null, self: null, organizer: null }).success).toBe(true);
+  });
+});
+
+describe("calendar_create_event attendee forwarding", () => {
+  it("forwards only organizer-controlled attendee fields", async () => {
+    const insert = vi.fn().mockResolvedValue({ data: { id: "evt1" } });
+    vi.spyOn(google, "calendar").mockReturnValue({ events: { insert }, calendars: { get: vi.fn().mockResolvedValue({ data: { timeZone: "UTC" } }) } } as never);
+    const tools = new Map<string, { shape: z.ZodRawShape; handler: (o: Record<string, unknown>) => Promise<unknown> }>();
+    registerCalendarTools({ tool: (n: string, _d: string, shape: z.ZodRawShape, handler: never) => { tools.set(n, { shape, handler }); } } as never, { auth: {} as never });
+    const t = tools.get("calendar_create_event")!;
+    const parsed = z.object(t.shape).parse({
+      calendarId: "primary", summary: "x", start: "2026-07-06T10:00:00Z", end: "2026-07-06T11:00:00Z",
+      attendees: [{ email: "b@example.com", optional: true, responseStatus: "accepted", comment: "c", self: true }],
+    });
+    await t.handler(parsed);
+    expect(insert.mock.calls[0][0].requestBody.attendees).toEqual([{ email: "b@example.com", optional: true }]);
+  });
+});
+
+describe("calendar_update_event RSVP preservation", () => {
+  type Handler = (opts: Record<string, unknown>) => Promise<unknown>;
+  const run = async (liveData: unknown, input: Record<string, unknown>) => {
+    const patch = vi.fn().mockResolvedValue({ data: { id: "evt1" } });
+    const get = vi.fn().mockResolvedValue({ data: liveData });
+    vi.spyOn(google, "calendar").mockReturnValue({ events: { patch, get } } as never);
+    const tools = new Map<string, { shape: z.ZodRawShape; handler: Handler }>();
+    registerCalendarTools({ tool: (n: string, _d: string, shape: z.ZodRawShape, handler: Handler) => { tools.set(n, { shape, handler }); } } as never, { auth: {} as never });
+    const t = tools.get("calendar_update_event")!;
+    await t.handler(z.object(t.shape).parse({ calendarId: "primary", eventId: "evt1", ...input }));
+    return { patch, get };
+  };
+
+  it("carries live responseStatus/comment/additionalGuests for existing attendees, ignoring stale input; new attendees get none", async () => {
+    const { patch } = await run(
+      { attendees: [
+        { email: "a@x.com", responseStatus: "accepted", comment: "yes", additionalGuests: 1 },
+        { email: "b@x.com", responseStatus: "declined" },
+      ] },
+      { attendees: [
+        { email: "a@x.com", responseStatus: "needsAction", comment: "stale", additionalGuests: 9 },
+        { email: "b@x.com" },
+        { email: "c@x.com", displayName: "C" },
+      ] },
+    );
+    expect(patch.mock.calls[0][0].requestBody.attendees).toEqual([
+      { email: "a@x.com", responseStatus: "accepted", comment: "yes", additionalGuests: 1 },
+      { email: "b@x.com", responseStatus: "declined" },
+      { email: "c@x.com", displayName: "C" },
+    ]);
+  });
+
+  it("matches emails case-insensitively and keeps the caller's email spelling", async () => {
+    const { patch } = await run(
+      { attendees: [{ email: "Alice@X.com", responseStatus: "tentative" }] },
+      { attendees: [{ email: "alice@x.COM" }] },
+    );
+    expect(patch.mock.calls[0][0].requestBody.attendees).toEqual([{ email: "alice@x.COM", responseStatus: "tentative" }]);
+  });
+
+  it("does not fetch the event when attendees is not provided", async () => {
+    const { patch, get } = await run({}, { summary: "new title" });
+    expect(get).not.toHaveBeenCalled();
+    expect(patch.mock.calls[0][0].requestBody).toEqual({ summary: "new title" });
+  });
+
+  it("does at most one events.get when both attendees and the timezone lookup need the event", async () => {
+    const { patch, get } = await run(
+      { attendees: [{ email: "a@x.com", responseStatus: "accepted" }], start: { timeZone: "America/New_York" } },
+      { attendees: [{ email: "a@x.com" }], start: "2026-07-06T10:00:00" },
+    );
+    expect(get).toHaveBeenCalledTimes(1);
+    const body = patch.mock.calls[0][0].requestBody;
+    expect(body.attendees).toEqual([{ email: "a@x.com", responseStatus: "accepted" }]);
+    expect(body.start).toEqual({ dateTime: "2026-07-06T10:00:00", timeZone: "America/New_York" });
   });
 });
