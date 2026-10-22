@@ -94,7 +94,8 @@ export function createServer(ctx: ServiceContext, opts: CreateServerOptions = {}
     FAMILY_REGISTRARS[family](server, ctx);
   }
 
-  // Fail at startup if any tool escaped the strict-params choke point.
+  // Fail at startup if any tool's top-level input schema is not strict (a
+  // registration that bypassed the choke point). Nested objects are not checked.
   if (strictParams) assertToolsStrict(server);
 
   return server;

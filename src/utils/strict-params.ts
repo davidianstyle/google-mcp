@@ -19,31 +19,39 @@ import { z } from "zod";
  * zod may report `invalid_union` instead, so the hint may not reach the client;
  * a `z.discriminatedUnion` shows it.
  *
- * Objects that declare a non-`never` catchall (`.passthrough()`, `z.looseObject`,
- * `.catchall(x)`) are an explicit opt-out and are left alone; an object that is
- * already `.strict()` (catchall `never`) is still walked, so strictness below it
- * is enforced too; `assertToolsStrict`
- * applies the same policy. A tool whose top-level schema has no properties at
- * all stays lenient (extra keys are ignored, not rejected): some clients send a
- * placeholder such as `random_string` to no-arg tools.
+ * Objects that declare a non-`never` catchall (`.passthrough()`,
+ * `z.looseObject`, `.catchall(x)`) are an explicit opt-out and are left alone;
+ * an object that is already `.strict()` (catchall `never`) is still walked, so
+ * strictness below it is enforced too; `assertToolsStrict` applies the same
+ * policy. A tool whose top-level schema has no properties at all stays lenient
+ * (extra keys are ignored, not rejected): some clients send a placeholder such
+ * as `random_string` to no-arg tools.
  *
  * Pipes (`.transform()`, `.pipe()`) are traversed through their input side
  * (`def.in`), which is what the raw arguments are parsed by. The output side
  * is not walked: in `z.string().transform(JSON.parse).pipe(z.object(...))` the
  * object after the pipe stays as written, so declare it `.strict()` yourself.
  * `.catch()` is deliberately not traversed (it throws below): a strict object
- * under `.catch()` would turn a typo into a silent fallback to the catch value. Node types this walker does not know how to traverse
- * (`z.preprocess`, whose input side is a bare transform, `z.lazy`,
- * `z.intersection`, `z.tuple`, and anything else added later) and recursive
- * schemas (a getter-based self-reference, where a node recurs on its own path)
- * might
- * hide an object below them, so the walker cannot vouch for strictness past
- * that point — it throws immediately, naming the tool and the path, rather
- * than registering a tool whose nested strictness is merely unverified.
+ * under `.catch()` would turn a typo into a silent fallback to the catch value.
+ *
+ * Node types this walker does not know how to traverse (`z.preprocess`, whose
+ * input side is a bare transform, `z.lazy`, `z.intersection`, `z.tuple`, and
+ * anything else added later) might hide an object below them, so the walker
+ * cannot vouch for strictness past that point. Recursive schemas (a
+ * getter-based self-reference) and schemas nested deeper than
+ * `MAX_SCHEMA_DEPTH` nodes cannot be walked to the end. In every one of these
+ * cases it throws immediately, naming the tool and the path, rather than
+ * registering a tool whose nested strictness is merely unverified.
  */
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnySchema = any;
+
+/**
+ * Deepest schema-node path the walker follows. Catches recursion the identity
+ * check cannot see: a getter that builds a fresh node on every access.
+ */
+const MAX_SCHEMA_DEPTH = 64;
 
 export interface StrictifyStats {
   /** Object nodes left alone because they already declared a catchall. */
@@ -130,8 +138,9 @@ function formatPath(path: ReadonlyArray<string | number>): string {
  * Walks a schema and rebuilds every reachable object node as strict
  * (unknown keys rejected). `toolName` and `path` are used only to name the
  * offending tool/location if the walk hits a node it cannot traverse.
- * `ancestors` holds the schema nodes on the current recursion path, so a
- * recursive schema is refused instead of overflowing the stack.
+ * `ancestors` holds the schema nodes on the current recursion path (its size
+ * is the current depth), so a recursive or overly deep schema is refused
+ * instead of overflowing the stack.
  */
 export function deepStrict(
   schema: AnySchema,
@@ -146,6 +155,12 @@ export function deepStrict(
     throw new Error(
       `strict-params: tool ${toolName} has a recursive schema at ${formatPath(path)}; recursive schemas are not ` +
         `supported under strict params, so registration is refused`
+    );
+  }
+  if (ancestors.size >= MAX_SCHEMA_DEPTH) {
+    throw new Error(
+      `strict-params: tool ${toolName} has a schema at ${formatPath(path)} that nests deeper than ` +
+        `${MAX_SCHEMA_DEPTH} nodes or recurses; registration is refused`
     );
   }
   ancestors.add(schema);

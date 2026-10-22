@@ -5,7 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer } from "../server.js";
-import { assertToolsStrict } from "./errors.js";
+import { assertToolsStrict, installToolErrorHandling } from "./errors.js";
 import { deepStrict, newStrictifyStats } from "./strict-params.js";
 
 function makeCtx() {
@@ -155,6 +155,27 @@ describe("strict tool parameters (registration choke point)", () => {
     expect(() => assertToolsStrict(s)).not.toThrow();
   });
 
+  it("refuses a recursive schema that builds a fresh node per access", () => {
+    const s = createServer(makeCtx(), { families: ["meet"] });
+    const mk = (): z.ZodTypeAny =>
+      z.object({
+        name: z.string(),
+        get kids() {
+          return z.array(mk()).optional();
+        },
+      });
+    let thrown: unknown;
+    try {
+      s.tool("fresh-recursion", { tree: mk() }, async () => ({ content: [] }));
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).not.toBeInstanceOf(RangeError);
+    expect(String(thrown)).toMatch(/fresh-recursion has a schema at tree\.kids\..* nests deeper than 64 nodes or recurses/);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(Object.keys((s as any)._registeredTools)).not.toContain("fresh-recursion");
+  });
+
   it("throws at registration when an object is nested under z.preprocess", () => {
     const s = createServer(makeCtx(), { families: ["meet"] });
     expect(() =>
@@ -164,6 +185,31 @@ describe("strict tool parameters (registration choke point)", () => {
         async () => ({ content: [] })
       )
     ).toThrow(/preprocess-gap/);
+  });
+});
+
+describe("schema reuse", () => {
+  it("accepts one object schema reused in siblings, an array and a union, each use strict", () => {
+    // A bare server with the real choke point, so no other tool's schema is involved.
+    const s = new McpServer({ name: "t", version: "0" });
+    installToolErrorHandling(s);
+    const Pt = z.object({ x: z.number() });
+    s.tool(
+      "reuse",
+      {
+        a: Pt.optional(),
+        b: Pt.optional(),
+        list: z.array(Pt).optional(),
+        either: z.union([Pt, z.string()]).optional(),
+      },
+      async () => ({ content: [] })
+    );
+    const schema = schemaOf(s, "reuse");
+    expect(schema.safeParse({ a: { x: 1 }, b: { x: 2 }, list: [{ x: 3 }], either: { x: 4 } }).success).toBe(true);
+    expect(schema.safeParse({ a: { x: 1, y: 0 } }).success).toBe(false);
+    expect(schema.safeParse({ b: { x: 1, y: 0 } }).success).toBe(false);
+    expect(schema.safeParse({ list: [{ x: 1, y: 0 }] }).success).toBe(false);
+    expect(schema.safeParse({ either: { x: 1, y: 0 } }).success).toBe(false);
   });
 });
 
