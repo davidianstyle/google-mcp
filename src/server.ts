@@ -94,8 +94,10 @@ export function createServer(ctx: ServiceContext, opts: CreateServerOptions = {}
     FAMILY_REGISTRARS[family](server, ctx);
   }
 
-  // Fail at startup if any tool's top-level input schema is not strict (a
-  // registration that bypassed the choke point). Nested objects are not checked.
+  // Fail at startup if a tool that takes parameters has a top-level input schema
+  // with no catchall (a registration that bypassed the choke point). An explicit
+  // catchall such as .passthrough() is tallied, not refused; nested objects are
+  // not checked.
   if (strictParams) assertToolsStrict(server);
 
   return server;
