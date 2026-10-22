@@ -134,6 +134,27 @@ describe("strict tool parameters (registration choke point)", () => {
     expect(schema.safeParse({ m: { k: { a: "x", extra: 1 } } }).success).toBe(false);
   });
 
+  it("refuses a recursive schema at registration and leaves no tool behind", () => {
+    const s = createServer(makeCtx(), { families: ["meet"] });
+    const Node = z.object({
+      name: z.string(),
+      get children() {
+        return z.array(Node).optional();
+      },
+    });
+    let thrown: unknown;
+    try {
+      s.tool("recursive-gap", { tree: Node.optional() }, async () => ({ content: [] }));
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).not.toBeInstanceOf(RangeError);
+    expect(String(thrown)).toMatch(/recursive-gap has a recursive schema at tree\.children\.\[\]; recursive schemas are not supported/);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(Object.keys((s as any)._registeredTools)).not.toContain("recursive-gap");
+    expect(() => assertToolsStrict(s)).not.toThrow();
+  });
+
   it("throws at registration when an object is nested under z.preprocess", () => {
     const s = createServer(makeCtx(), { families: ["meet"] });
     expect(() =>
@@ -215,6 +236,7 @@ describe("GOOGLE_MCP_STRICT_PARAMS runtime opt-out", () => {
       {
         range: z.object({ start: z.string(), end: z.string() }).optional(),
         none: z.object({}).optional(),
+        blanket: z.object({ a: z.string() }, "must be an object").optional(),
         authored: z
           .strictObject(
             { a: z.string() },
@@ -293,6 +315,17 @@ describe("GOOGLE_MCP_STRICT_PARAMS runtime opt-out", () => {
     expect(text(authored)).not.toContain("Valid keys");
     const plain = await client.callTool({ name: "nested_args", arguments: { range: { start: "a", end: "b", x: 1 } } });
     expect(text(plain)).toContain('Unrecognized key: "x". Valid keys: start, end at range');
+  });
+
+  it("unset: a blanket object message does not replace the valid-keys hint", async () => {
+    vi.stubEnv("GOOGLE_MCP_STRICT_PARAMS", undefined);
+    const client = await connect();
+    const stray = await client.callTool({ name: "nested_args", arguments: { blanket: { a: "x", b: 1 } } });
+    expect(stray.isError).toBe(true);
+    expect(text(stray)).toContain('Unrecognized key: "b". Valid keys: a at blanket');
+    const wrongType = await client.callTool({ name: "nested_args", arguments: { blanket: "not-an-object" } });
+    expect(wrongType.isError).toBe(true);
+    expect(text(wrongType)).toContain("must be an object at blanket");
   });
 
   it("=0: the same call succeeds and the stray key is dropped; one stderr line names the variable", async () => {

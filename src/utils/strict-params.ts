@@ -34,7 +34,9 @@ import { z } from "zod";
  * `.catch()` is deliberately not traversed (it throws below): a strict object
  * under `.catch()` would turn a typo into a silent fallback to the catch value. Node types this walker does not know how to traverse
  * (`z.preprocess`, whose input side is a bare transform, `z.lazy`,
- * `z.intersection`, `z.tuple`, and anything else added later) might
+ * `z.intersection`, `z.tuple`, and anything else added later) and recursive
+ * schemas (a getter-based self-reference, where a node recurs on its own path)
+ * might
  * hide an object below them, so the walker cannot vouch for strictness past
  * that point — it throws immediately, naming the tool and the path, rather
  * than registering a tool whose nested strictness is merely unverified.
@@ -100,14 +102,17 @@ function cloneWith(schema: AnySchema, patch: Record<string, unknown>): AnySchema
 
 /**
  * Error map for a strict object node: an unrecognized-key issue raised by this
- * node also names the keys it accepts, so a client can correct the call, unless
- * the node's own error map already supplies a message for it. Every other issue
- * falls through to the node's own error map (if any), then zod's.
+ * node also names the keys it accepts, so a client can correct the call. An
+ * object that was already strict as authored keeps its own message for that
+ * issue when its error map supplies one; for any other object the error map
+ * may be a blanket message (`z.object(shape, "msg")` answers every issue), so
+ * it is not consulted for unknown keys. Every other issue falls through to the
+ * node's own error map (if any), then zod's.
  */
-function unknownKeyError(validKeys: string[], previous: AnySchema): AnySchema {
+function unknownKeyError(validKeys: string[], previous: AnySchema, authoredStrict: boolean): AnySchema {
   return (issue: AnySchema) => {
     if (issue.code === "unrecognized_keys") {
-      const own = previous?.(issue);
+      const own = authoredStrict ? previous?.(issue) : undefined;
       if (typeof own === "string" || typeof own?.message === "string") return own;
       const keys = (issue.keys as string[]).map((k) => JSON.stringify(k)).join(", ");
       const valid = validKeys.length > 0 ? validKeys.join(", ") : "(none)";
@@ -124,16 +129,41 @@ function formatPath(path: ReadonlyArray<string | number>): string {
 /**
  * Walks a schema and rebuilds every reachable object node as strict
  * (unknown keys rejected). `toolName` and `path` are used only to name the
- * offending tool/location if the walk hits a node type it cannot traverse.
+ * offending tool/location if the walk hits a node it cannot traverse.
+ * `ancestors` holds the schema nodes on the current recursion path, so a
+ * recursive schema is refused instead of overflowing the stack.
  */
 export function deepStrict(
   schema: AnySchema,
   stats: StrictifyStats,
   toolName = "<unknown>",
-  path: ReadonlyArray<string | number> = []
+  path: ReadonlyArray<string | number> = [],
+  ancestors: Set<AnySchema> = new Set()
 ): AnySchema {
   const def = schema?._zod?.def;
   if (!def) return schema;
+  if (ancestors.has(schema)) {
+    throw new Error(
+      `strict-params: tool ${toolName} has a recursive schema at ${formatPath(path)}; recursive schemas are not ` +
+        `supported under strict params, so registration is refused`
+    );
+  }
+  ancestors.add(schema);
+  try {
+    return walk(schema, def, stats, toolName, path, ancestors);
+  } finally {
+    ancestors.delete(schema);
+  }
+}
+
+function walk(
+  schema: AnySchema,
+  def: AnySchema,
+  stats: StrictifyStats,
+  toolName: string,
+  path: ReadonlyArray<string | number>,
+  ancestors: Set<AnySchema>
+): AnySchema {
   const type: string = def.type;
 
   if (type === "object") {
@@ -143,33 +173,40 @@ export function deepStrict(
     }
     const shape: Record<string, AnySchema> = {};
     for (const [key, child] of Object.entries(def.shape as Record<string, AnySchema>)) {
-      shape[key] = deepStrict(child, stats, toolName, [...path, key]);
+      shape[key] = deepStrict(child, stats, toolName, [...path, key], ancestors);
     }
-    return cloneWith(schema, { shape, catchall: z.never(), error: unknownKeyError(Object.keys(shape), def.error) });
+    const authoredStrict = def.catchall?._zod?.def?.type === "never";
+    return cloneWith(schema, {
+      shape,
+      catchall: z.never(),
+      error: unknownKeyError(Object.keys(shape), def.error, authoredStrict),
+    });
   }
 
   if (INNER_TYPE_WRAPPERS.has(type)) {
-    const inner = deepStrict(def.innerType, stats, toolName, path);
+    const inner = deepStrict(def.innerType, stats, toolName, path, ancestors);
     return inner === def.innerType ? schema : cloneWith(schema, { innerType: inner });
   }
 
   if (type === "array") {
-    const element = deepStrict(def.element, stats, toolName, [...path, "[]"]);
+    const element = deepStrict(def.element, stats, toolName, [...path, "[]"], ancestors);
     return element === def.element ? schema : cloneWith(schema, { element });
   }
 
   if (type === "union") {
-    const options = (def.options as AnySchema[]).map((o, i) => deepStrict(o, stats, toolName, [...path, `|${i}`]));
+    const options = (def.options as AnySchema[]).map((o, i) =>
+      deepStrict(o, stats, toolName, [...path, `|${i}`], ancestors)
+    );
     return options.every((o, i) => o === def.options[i]) ? schema : cloneWith(schema, { options });
   }
 
   if (type === "pipe") {
-    const input = deepStrict(def.in, stats, toolName, path);
+    const input = deepStrict(def.in, stats, toolName, path, ancestors);
     return input === def.in ? schema : cloneWith(schema, { in: input });
   }
 
   if (type === "record") {
-    const valueType = deepStrict(def.valueType, stats, toolName, [...path, "{}"]);
+    const valueType = deepStrict(def.valueType, stats, toolName, [...path, "{}"], ancestors);
     return valueType === def.valueType ? schema : cloneWith(schema, { valueType });
   }
 
