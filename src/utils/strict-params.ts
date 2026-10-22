@@ -1,0 +1,268 @@
+import { z } from "zod";
+
+/**
+ * Strict tool parameters, applied at the registration choke point.
+ *
+ * Every tool here is registered with a zod *raw shape*; the MCP SDK turns that
+ * into a plain `z.object(shape)`, whose default is to STRIP unknown keys. A
+ * misspelled parameter (`timezone` for `timeZone`, `bcc_list` for `bcc`) is
+ * therefore discarded silently and the call reports success.
+ *
+ * `strictifyRegisteredSchema` rebuilds a registered input schema so that every
+ * object node — the top level and every nested object reachable through
+ * optional / nullable / default / array / union wrappers — rejects unknown keys.
+ * Leaves are reused by identity, so descriptions, defaults, enums and checks are
+ * untouched; wrappers are cloned with their `def` intact (checks such as
+ * `.min(1)` survive) and parented to the original, so registry metadata
+ * (`.describe()`) is inherited. Each rebuilt object's unrecognized-key error
+ * also names the keys that object accepts. Inside a plain `z.union` of objects
+ * zod may report `invalid_union` instead, so the hint may not reach the client;
+ * a `z.discriminatedUnion` shows it.
+ *
+ * Objects that declare a non-`never` catchall (`.passthrough()`,
+ * `z.looseObject`, `.catchall(x)`) are an explicit opt-out and are left alone;
+ * an object that is already `.strict()` (catchall `never`) is still walked, so
+ * strictness below it is enforced too; `assertToolsStrict` applies the same
+ * policy. A tool whose top-level schema has no properties at all stays lenient
+ * (extra keys are ignored, not rejected): some clients send a placeholder such
+ * as `random_string` to no-arg tools.
+ *
+ * Pipes (`.transform()`, `.pipe()`) are traversed through their input side
+ * (`def.in`), which is what the raw arguments are parsed by. The output side
+ * is not walked: in `z.string().transform(JSON.parse).pipe(z.object(...))` the
+ * object after the pipe stays as written, so declare it `.strict()` yourself.
+ * `.catch()` is deliberately not traversed (it throws below): a strict object
+ * under `.catch()` would turn a typo into a silent fallback to the catch value.
+ *
+ * Node types this walker does not know how to traverse (`z.preprocess`, whose
+ * input side is a bare transform, `z.lazy`, `z.intersection`, `z.tuple`, and
+ * anything else added later) might hide an object below them, so the walker
+ * cannot vouch for strictness past that point. Recursive schemas (a
+ * getter-based self-reference) and schemas nested deeper than
+ * `MAX_SCHEMA_DEPTH` nodes cannot be walked to the end. In every one of these
+ * cases it throws immediately, naming the tool and the path, rather than
+ * registering a tool whose nested strictness is merely unverified.
+ */
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnySchema = any;
+
+/**
+ * Deepest schema-node path the walker follows. Catches recursion the identity
+ * check cannot see: a getter that builds a fresh node on every access.
+ */
+const MAX_SCHEMA_DEPTH = 64;
+
+export interface StrictifyStats {
+  /** Object nodes left alone because they already declared a catchall. */
+  explicitCatchall: number;
+}
+
+export function newStrictifyStats(): StrictifyStats {
+  return { explicitCatchall: 0 };
+}
+
+/** Wrapper types whose single child lives at `def.innerType`. */
+const INNER_TYPE_WRAPPERS = new Set([
+  "optional",
+  "nullable",
+  "default",
+  "prefault",
+  "nonoptional",
+  "readonly",
+]);
+
+/** Leaf types: nothing below them can carry object keys. */
+const LEAF_TYPES = new Set([
+  "string",
+  "number",
+  "int",
+  "boolean",
+  "bigint",
+  "date",
+  "enum",
+  "literal",
+  "unknown",
+  "any",
+  "null",
+  "undefined",
+  "never",
+  "void",
+  "nan",
+  "symbol",
+  "file",
+  "template_literal",
+  // record keys are open by definition (a map), so nothing to make strict at
+  // this level; its value schema is traversed below via `valueType`.
+]);
+
+function cloneWith(schema: AnySchema, patch: Record<string, unknown>): AnySchema {
+  // Merge by property descriptor, not spread: some defs expose getters (a
+  // `default` def's `defaultValue` re-evaluates function defaults per parse),
+  // and a spread would freeze them into a single value.
+  const def = Object.defineProperties(
+    {},
+    { ...Object.getOwnPropertyDescriptors(schema._zod.def), ...Object.getOwnPropertyDescriptors(patch) }
+  );
+  // `{ parent: schema }` makes the clone inherit registry metadata (.describe()).
+  return schema.clone(def, { parent: schema });
+}
+
+/**
+ * Error map for a strict object node: an unrecognized-key issue raised by this
+ * node also names the keys it accepts, so a client can correct the call. An
+ * object that was already strict as authored keeps its own message for that
+ * issue when its error map supplies one; for any other object the error map
+ * may be a blanket message (`z.object(shape, "msg")` answers every issue), so
+ * it is not consulted for unknown keys. Every other issue falls through to the
+ * node's own error map (if any), then zod's.
+ */
+function unknownKeyError(validKeys: string[], previous: AnySchema, authoredStrict: boolean): AnySchema {
+  return (issue: AnySchema) => {
+    if (issue.code === "unrecognized_keys") {
+      const own = authoredStrict ? previous?.(issue) : undefined;
+      if (typeof own === "string" || typeof own?.message === "string") return own;
+      const keys = (issue.keys as string[]).map((k) => JSON.stringify(k)).join(", ");
+      const valid = validKeys.length > 0 ? validKeys.join(", ") : "(none)";
+      return `Unrecognized key${issue.keys.length > 1 ? "s" : ""}: ${keys}. Valid keys: ${valid}`;
+    }
+    return previous?.(issue);
+  };
+}
+
+function formatPath(path: ReadonlyArray<string | number>): string {
+  return path.length === 0 ? "<root>" : path.join(".");
+}
+
+/**
+ * Walks a schema and rebuilds every reachable object node as strict
+ * (unknown keys rejected). `toolName` and `path` are used only to name the
+ * offending tool/location if the walk hits a node it cannot traverse.
+ * `ancestors` holds the schema nodes on the current recursion path (its size
+ * is the current depth), so a recursive or overly deep schema is refused
+ * instead of overflowing the stack.
+ */
+export function deepStrict(
+  schema: AnySchema,
+  stats: StrictifyStats,
+  toolName = "<unknown>",
+  path: ReadonlyArray<string | number> = [],
+  ancestors: Set<AnySchema> = new Set()
+): AnySchema {
+  const def = schema?._zod?.def;
+  if (!def) return schema;
+  if (ancestors.has(schema)) {
+    throw new Error(
+      `strict-params: tool ${toolName} has a recursive schema at ${formatPath(path)}; recursive schemas are not ` +
+        `supported under strict params, so registration is refused`
+    );
+  }
+  if (ancestors.size >= MAX_SCHEMA_DEPTH) {
+    throw new Error(
+      `strict-params: tool ${toolName} has a schema at ${formatPath(path)} that nests deeper than ` +
+        `${MAX_SCHEMA_DEPTH} nodes or recurses; registration is refused`
+    );
+  }
+  ancestors.add(schema);
+  try {
+    return walk(schema, def, stats, toolName, path, ancestors);
+  } finally {
+    ancestors.delete(schema);
+  }
+}
+
+function walk(
+  schema: AnySchema,
+  def: AnySchema,
+  stats: StrictifyStats,
+  toolName: string,
+  path: ReadonlyArray<string | number>,
+  ancestors: Set<AnySchema>
+): AnySchema {
+  const type: string = def.type;
+
+  if (type === "object") {
+    if (def.catchall !== undefined && def.catchall?._zod?.def?.type !== "never") {
+      stats.explicitCatchall++;
+      return schema;
+    }
+    const shape: Record<string, AnySchema> = {};
+    for (const [key, child] of Object.entries(def.shape as Record<string, AnySchema>)) {
+      shape[key] = deepStrict(child, stats, toolName, [...path, key], ancestors);
+    }
+    const authoredStrict = def.catchall?._zod?.def?.type === "never";
+    return cloneWith(schema, {
+      shape,
+      catchall: z.never(),
+      error: unknownKeyError(Object.keys(shape), def.error, authoredStrict),
+    });
+  }
+
+  if (INNER_TYPE_WRAPPERS.has(type)) {
+    const inner = deepStrict(def.innerType, stats, toolName, path, ancestors);
+    return inner === def.innerType ? schema : cloneWith(schema, { innerType: inner });
+  }
+
+  if (type === "array") {
+    const element = deepStrict(def.element, stats, toolName, [...path, "[]"], ancestors);
+    return element === def.element ? schema : cloneWith(schema, { element });
+  }
+
+  if (type === "union") {
+    const options = (def.options as AnySchema[]).map((o, i) =>
+      deepStrict(o, stats, toolName, [...path, `|${i}`], ancestors)
+    );
+    return options.every((o, i) => o === def.options[i]) ? schema : cloneWith(schema, { options });
+  }
+
+  if (type === "pipe") {
+    const input = deepStrict(def.in, stats, toolName, path, ancestors);
+    return input === def.in ? schema : cloneWith(schema, { in: input });
+  }
+
+  if (type === "record") {
+    const valueType = deepStrict(def.valueType, stats, toolName, [...path, "{}"], ancestors);
+    return valueType === def.valueType ? schema : cloneWith(schema, { valueType });
+  }
+
+  if (!LEAF_TYPES.has(type)) {
+    throw new Error(
+      `strict-params: tool ${toolName} has a node of type "${type}" at ${formatPath(path)} that this choke ` +
+        `point cannot traverse; it may hide an object that would stay non-strict, so registration is refused`
+    );
+  }
+  return schema;
+}
+
+/** True for an object schema with no properties and no catchall (a no-arg tool). */
+export function isZeroParamObject(def: AnySchema): boolean {
+  return def?.type === "object" && def.catchall === undefined && Object.keys(def.shape ?? {}).length === 0;
+}
+
+/**
+ * Rebuilds a RegisteredTool's `inputSchema` (as produced by the SDK from a raw
+ * shape) as a deep-strict object. Returns `undefined` for tools registered with
+ * no schema at all — those receive `(extra)` instead of `(args, extra)`, so
+ * adding a schema would change the callback's arity.
+ *
+ * Throws on a top-level schema that is not an object: that is a registration
+ * form this choke point does not understand, and it must fail at startup rather
+ * than register a tool with an unknown strictness posture. (A non-object node
+ * found deeper in the walk is handled by `deepStrict` itself, the same way.)
+ */
+export function strictifyRegisteredSchema(
+  toolName: string,
+  inputSchema: AnySchema,
+  stats: StrictifyStats
+): AnySchema {
+  if (inputSchema === undefined) return undefined;
+  const def = inputSchema?._zod?.def;
+  if (!def || def.type !== "object") {
+    throw new Error(
+      `strict-params: tool ${toolName} has a non-object input schema (type ${def?.type ?? "unknown"}); ` +
+        `the registration choke point cannot make it strict`
+    );
+  }
+  if (isZeroParamObject(def)) return inputSchema; // no-arg tool: stay lenient
+  return deepStrict(inputSchema, stats, toolName);
+}

@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
+import { isZeroParamObject, newStrictifyStats, strictifyRegisteredSchema } from "./strict-params.js";
 
 /** Shape of the pieces of a GaxiosError we read. Duck-typed so tests don't need a real GaxiosError. */
 interface GaxiosLikeError {
@@ -141,19 +142,85 @@ export function wrapTool<T extends AnyToolCallback>(handler: T, opts: MapGoogleE
 
 /**
  * Single choke point: patches `server.tool` so every tool registered from
- * here on (across all services) has its handler wrapped with `wrapTool`,
- * without needing to touch each of the individual tool registrations.
+ * here on (across all services) has its handler wrapped with `wrapTool` and,
+ * unless `strictParams` is false, its input schema made strict, without
+ * needing to touch each of the individual tool registrations.
  */
-export function installToolErrorHandling(server: McpServer, opts: MapGoogleErrorOptions = {}): void {
+export function installToolErrorHandling(
+  server: McpServer,
+  opts: MapGoogleErrorOptions & { strictParams?: boolean } = {}
+): void {
+  const { strictParams = true, ...errorOpts } = opts;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const original = server.tool.bind(server) as (...args: any[]) => unknown;
+  const original = server.tool.bind(server) as (...args: any[]) => any;
+  const stats = newStrictifyStats();
   // `tool` has many overloads but the callback is always the last argument.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (server as any).tool = (...args: any[]) => {
     const lastIndex = args.length - 1;
     if (typeof args[lastIndex] === "function") {
-      args[lastIndex] = wrapTool(args[lastIndex], opts);
+      args[lastIndex] = wrapTool(args[lastIndex], errorOpts);
     }
-    return original(...args);
+    // Strictness off: keep the SDK's own schema, which strips unknown keys.
+    if (!strictParams) return original(...args);
+    // Let the SDK resolve its own overloads (description / raw shape /
+    // annotations, in any combination), then make the schema it built strict.
+    // Post-processing the RegisteredTool avoids re-implementing the overload
+    // parsing here, which is where a choke point could mis-register silently.
+    const registered = original(...args);
+    try {
+      // Private SDK field. An SDK that cached or copied the schema at
+      // registration would silently lose strictness; a request-path test that
+      // sends a stray key through the SDK's real validation catches that. The
+      // SDK's own `registered.update({ paramsSchema })` also
+      // rebuilds this field from the raw shape, silently undoing strictness for
+      // that tool, so nothing here may call it.
+      registered.inputSchema = strictifyRegisteredSchema(args[0], registered.inputSchema, stats);
+    } catch (error) {
+      // The SDK has already registered the tool with its loose default schema;
+      // never leave that behind when strictification refuses.
+      registered.remove();
+      throw error;
+    }
+    return registered;
   };
+}
+
+/**
+ * Startup check of each registered tool's TOP-LEVEL input schema only: it is
+ * either absent or an object with no properties (a no-arg tool, lenient on
+ * purpose), or an object that declares a catchall. A `never` catchall (what the
+ * choke point installs) is tallied as `strict`; any other catchall
+ * (`.passthrough()` / `looseObject` / `.catchall(x)`) is a deliberate opt-out,
+ * tallied as `passthrough`. A top-level object with no catchall fails the
+ * check, which catches a registration that bypassed the patched `server.tool`
+ * (e.g. a direct `registerTool` call). Nested objects are not inspected: a
+ * bypassing registration with a strict top level but a loose nested object
+ * passes. Throws, so a violation fails at startup, not per call.
+ */
+export function assertToolsStrict(server: McpServer): { strict: number; passthrough: number; noArgs: number } {
+  // `_registeredTools` is a private SDK field; fail clearly if an SDK upgrade moves it.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const tools = (server as any)._registeredTools as Record<string, { inputSchema?: any }> | undefined;
+  if (tools === undefined || tools === null || typeof tools !== "object") {
+    throw new Error(
+      "strict-params: McpServer._registeredTools (private SDK internal) is missing; the installed " +
+        "@modelcontextprotocol/sdk no longer matches what assertToolsStrict expects"
+    );
+  }
+  let strict = 0;
+  let passthrough = 0;
+  let noArgs = 0;
+  const offenders: string[] = [];
+  for (const [name, tool] of Object.entries(tools)) {
+    const def = tool.inputSchema?._zod?.def;
+    if (tool.inputSchema === undefined || isZeroParamObject(def)) noArgs++;
+    else if (def?.type === "object" && def.catchall?._zod?.def?.type === "never") strict++;
+    else if (def?.type === "object" && def.catchall !== undefined) passthrough++;
+    else offenders.push(name);
+  }
+  if (offenders.length > 0) {
+    throw new Error(`strict-params: tools registered without strict input schemas: ${offenders.join(", ")}`);
+  }
+  return { strict, passthrough, noArgs };
 }
