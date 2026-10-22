@@ -23,10 +23,11 @@ describe("strict tool parameters (registration choke point)", () => {
   const event = { calendarId: "primary", summary: "s", start: "2026-10-01T10:00:00", end: "2026-10-01T11:00:00" };
 
   it("makes every registered tool strict", () => {
-    const { strict, noArgs } = assertToolsStrict(server);
+    const { strict, passthrough, noArgs } = assertToolsStrict(server);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect(strict + noArgs).toBe(Object.keys((server as any)._registeredTools).length);
+    expect(strict + passthrough + noArgs).toBe(Object.keys((server as any)._registeredTools).length);
     expect(strict).toBeGreaterThan(100);
+    expect(passthrough).toBe(0);
   });
 
   it("rejects a misspelled top-level parameter", () => {
@@ -65,10 +66,14 @@ describe("strict tool parameters (registration choke point)", () => {
   it("assertToolsStrict accepts an explicit top-level passthrough as an opt-out", () => {
     const s = createServer(makeCtx(), { families: ["meet"] });
     s.tool("loose", { a: z.string() }, async () => ({ content: [] }));
+    const before = assertToolsStrict(s);
     // simulate an explicit catchall schema registered by hand
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (s as any)._registeredTools["loose"].inputSchema = z.looseObject({ a: z.string() });
-    expect(() => assertToolsStrict(s)).not.toThrow();
+    const after = assertToolsStrict(s);
+    // counted as passthrough, not strict
+    expect(after.passthrough).toBe(before.passthrough + 1);
+    expect(after.strict).toBe(before.strict - 1);
   });
 
   it("assertToolsStrict names the missing private SDK internal", () => {
@@ -168,6 +173,9 @@ describe("GOOGLE_MCP_STRICT_PARAMS runtime opt-out", () => {
     s.tool("echo_args", { timeZone: z.string().optional() }, async (args) => ({
       content: [{ type: "text", text: JSON.stringify(args) }],
     }));
+    s.tool("nested_args", { range: z.object({ start: z.string(), end: z.string() }).optional() }, async (args) => ({
+      content: [{ type: "text", text: JSON.stringify(args) }],
+    }));
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     await s.connect(serverSide);
     const client = new Client({ name: "test", version: "0" });
@@ -191,6 +199,22 @@ describe("GOOGLE_MCP_STRICT_PARAMS runtime opt-out", () => {
     expect(errSpy).not.toHaveBeenCalledWith(expect.stringContaining("GOOGLE_MCP_STRICT_PARAMS"));
   });
 
+  it("unset: the rejection names the valid keys at the level of the stray key", async () => {
+    vi.stubEnv("GOOGLE_MCP_STRICT_PARAMS", undefined);
+    const client = await connect();
+    const top = await client.callTool({ name: "calendar_get_current_time", arguments: stray });
+    expect(text(top)).toMatch(/^MCP error -32602: /);
+    expect(text(top)).toContain('Unrecognized key: "tmiezone". Valid keys: timeZone');
+    const two = await client.callTool({ name: "calendar_get_current_time", arguments: { tz: "UTC", zone: "UTC" } });
+    expect(text(two)).toContain('Unrecognized keys: "tz", "zone". Valid keys: timeZone');
+    const nested = await client.callTool({
+      name: "nested_args",
+      arguments: { range: { start: "a", end: "b", ennd: "c" } },
+    });
+    expect(nested.isError).toBe(true);
+    expect(text(nested)).toContain('Unrecognized key: "ennd". Valid keys: start, end at range');
+  });
+
   it("=0: the same call succeeds and the stray key is dropped; one stderr line names the variable", async () => {
     vi.stubEnv("GOOGLE_MCP_STRICT_PARAMS", "0");
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -201,6 +225,12 @@ describe("GOOGLE_MCP_STRICT_PARAMS runtime opt-out", () => {
     const now = await client.callTool({ name: "calendar_get_current_time", arguments: stray });
     expect(now.isError).toBeFalsy();
     expect(JSON.parse(text(now)).timeZone).toBe("UTC");
+    const nested = await client.callTool({
+      name: "nested_args",
+      arguments: { range: { start: "a", end: "b", ennd: "c" } },
+    });
+    expect(nested.isError).toBeFalsy();
+    expect(JSON.parse(text(nested))).toEqual({ range: { start: "a", end: "b" } });
     const lines = errSpy.mock.calls.filter((c) => String(c[0]).includes("GOOGLE_MCP_STRICT_PARAMS"));
     expect(lines).toHaveLength(1);
   });

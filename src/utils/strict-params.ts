@@ -14,7 +14,8 @@ import { z } from "zod";
  * Leaves are reused by identity, so descriptions, defaults, enums and checks are
  * untouched; wrappers are cloned with their `def` intact (checks such as
  * `.min(1)` survive) and parented to the original, so registry metadata
- * (`.describe()`) is inherited.
+ * (`.describe()`) is inherited. Each rebuilt object's unrecognized-key error
+ * also names the keys that object accepts.
  *
  * Objects that declare a non-`never` catchall (`.passthrough()`, `z.looseObject`,
  * `.catchall(x)`) are an explicit opt-out and are left alone; an object that is
@@ -97,6 +98,21 @@ function cloneWith(schema: AnySchema, patch: Record<string, unknown>): AnySchema
   return schema.clone(def, { parent: schema });
 }
 
+/**
+ * Error map for a strict object node: an unrecognized-key issue raised by this
+ * node also names the keys it accepts, so a client can correct the call. Every
+ * other issue falls through to the node's own error map (if any), then zod's.
+ */
+function unknownKeyError(validKeys: string[], previous: AnySchema): AnySchema {
+  return (issue: AnySchema) => {
+    if (issue.code === "unrecognized_keys") {
+      const keys = (issue.keys as string[]).map((k) => JSON.stringify(k)).join(", ");
+      return `Unrecognized key${issue.keys.length > 1 ? "s" : ""}: ${keys}. Valid keys: ${validKeys.join(", ")}`;
+    }
+    return previous?.(issue);
+  };
+}
+
 function formatPath(path: ReadonlyArray<string | number>): string {
   return path.length === 0 ? "<root>" : path.join(".");
 }
@@ -126,7 +142,7 @@ export function deepStrict(
       shape[key] = deepStrict(child, stats, toolName, [...path, key]);
     }
     stats.objects++;
-    return cloneWith(schema, { shape, catchall: z.never() });
+    return cloneWith(schema, { shape, catchall: z.never(), error: unknownKeyError(Object.keys(shape), def.error) });
   }
 
   if (INNER_TYPE_WRAPPERS.has(type)) {

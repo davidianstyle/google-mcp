@@ -170,6 +170,7 @@ export function installToolErrorHandling(
     // parsing here, which is where a choke point could mis-register silently.
     const registered = original(...args);
     try {
+      // Private SDK field: an SDK that cached or copied the schema at registration would silently lose strictness; the request-path test "unset: a stray key is rejected with an input validation error" catches that.
       registered.inputSchema = strictifyRegisteredSchema(args[0], registered.inputSchema, stats);
     } catch (error) {
       // The SDK has already registered the tool with its loose default schema;
@@ -191,11 +192,11 @@ export const strictifyStats = new WeakMap<McpServer, StrictifyStats>();
  * catchall is accepted: `never` is what the choke point installs, and any other
  * catchall (`.passthrough()` / `looseObject` / `.catchall(x)`) is a deliberate
  * opt-out that `deepStrict` also leaves alone, so the two policies agree.
- * Catches any registration that bypassed the patched `server.tool` (e.g. a
+ * Such opt-outs are tallied as `passthrough`, not `strict`. Catches any registration that bypassed the patched `server.tool` (e.g. a
  * future direct `registerTool` call). Throws, so a violation fails at startup,
  * not per call.
  */
-export function assertToolsStrict(server: McpServer): { strict: number; noArgs: number } {
+export function assertToolsStrict(server: McpServer): { strict: number; passthrough: number; noArgs: number } {
   // `_registeredTools` is a private SDK field; fail clearly if an SDK upgrade moves it.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const tools = (server as any)._registeredTools as Record<string, { inputSchema?: any }> | undefined;
@@ -206,16 +207,18 @@ export function assertToolsStrict(server: McpServer): { strict: number; noArgs: 
     );
   }
   let strict = 0;
+  let passthrough = 0;
   let noArgs = 0;
   const offenders: string[] = [];
   for (const [name, tool] of Object.entries(tools)) {
     const def = tool.inputSchema?._zod?.def;
     if (tool.inputSchema === undefined || isZeroParamObject(def)) noArgs++;
-    else if (def?.type === "object" && def.catchall !== undefined) strict++;
+    else if (def?.type === "object" && def.catchall?._zod?.def?.type === "never") strict++;
+    else if (def?.type === "object" && def.catchall !== undefined) passthrough++;
     else offenders.push(name);
   }
   if (offenders.length > 0) {
     throw new Error(`strict-params: tools registered without strict input schemas: ${offenders.join(", ")}`);
   }
-  return { strict, noArgs };
+  return { strict, passthrough, noArgs };
 }
