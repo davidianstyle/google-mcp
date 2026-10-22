@@ -74,14 +74,23 @@ export function createServer(ctx: ServiceContext, opts: CreateServerOptions = {}
   // functions below gets its handler wrapped with Google API error mapping
   // and its input schema made strict (unknown parameters are rejected instead
   // of silently dropped), without editing each individual tool registration.
-  installToolErrorHandling(server, { accountSlug: ctx.accountSlug });
+  // GOOGLE_MCP_STRICT_PARAMS=0 is a runtime opt-out: unknown parameters are
+  // dropped silently (the SDK default) instead of rejected. Any other value,
+  // or unset, keeps strict checking on.
+  const strictParams = process.env.GOOGLE_MCP_STRICT_PARAMS !== "0";
+  if (!strictParams) {
+    console.error(
+      "[google-mcp] strict param checking is OFF (GOOGLE_MCP_STRICT_PARAMS=0): unknown tool parameters are dropped silently"
+    );
+  }
+  installToolErrorHandling(server, { accountSlug: ctx.accountSlug, strictParams });
 
   for (const family of opts.families ?? TOOL_FAMILIES) {
     FAMILY_REGISTRARS[family](server, ctx);
   }
 
   // Fail at startup if any tool escaped the strict-params choke point.
-  assertToolsStrict(server);
+  if (strictParams) assertToolsStrict(server);
 
   return server;
 }

@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { OAuth2Client } from "google-auth-library";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer } from "../server.js";
 import { assertToolsStrict } from "./errors.js";
 import { deepStrict, newStrictifyStats } from "./strict-params.js";
@@ -149,5 +151,57 @@ describe("deepStrict edge cases", () => {
     expect(() =>
       deepStrict(z.object({ o: z.object({ a: z.string() }).catch({ a: "DEFAULT" }) }), newStrictifyStats())
     ).toThrow(/catch/);
+  });
+});
+
+describe("GOOGLE_MCP_STRICT_PARAMS runtime opt-out", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  // Builds the server exactly as startup does (env read inside createServer),
+  // registers an argument-echoing tool through the same patched `server.tool`
+  // every service uses, and connects a real MCP client to it.
+  async function connect() {
+    const s = createServer(makeCtx(), { families: ["calendar"] });
+    s.tool("echo_args", { timeZone: z.string().optional() }, async (args) => ({
+      content: [{ type: "text", text: JSON.stringify(args) }],
+    }));
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await s.connect(serverSide);
+    const client = new Client({ name: "test", version: "0" });
+    await client.connect(clientSide);
+    return client;
+  }
+  const stray = { timeZone: "UTC", tmiezone: "UTC" };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const text = (r: any) => r.content[0].text as string;
+
+  it("unset: a stray key is rejected with an input validation error", async () => {
+    vi.stubEnv("GOOGLE_MCP_STRICT_PARAMS", undefined);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const client = await connect();
+    for (const name of ["echo_args", "calendar_get_current_time"]) {
+      const r = await client.callTool({ name, arguments: stray });
+      expect(r.isError).toBe(true);
+      expect(text(r)).toMatch(/-32602/);
+      expect(text(r)).toContain("tmiezone");
+    }
+    expect(errSpy).not.toHaveBeenCalledWith(expect.stringContaining("GOOGLE_MCP_STRICT_PARAMS"));
+  });
+
+  it("=0: the same call succeeds and the stray key is dropped; one stderr line names the variable", async () => {
+    vi.stubEnv("GOOGLE_MCP_STRICT_PARAMS", "0");
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const client = await connect();
+    const echoed = await client.callTool({ name: "echo_args", arguments: stray });
+    expect(echoed.isError).toBeFalsy();
+    expect(JSON.parse(text(echoed))).toEqual({ timeZone: "UTC" });
+    const now = await client.callTool({ name: "calendar_get_current_time", arguments: stray });
+    expect(now.isError).toBeFalsy();
+    expect(JSON.parse(text(now)).timeZone).toBe("UTC");
+    const lines = errSpy.mock.calls.filter((c) => String(c[0]).includes("GOOGLE_MCP_STRICT_PARAMS"));
+    expect(lines).toHaveLength(1);
   });
 });

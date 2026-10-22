@@ -142,10 +142,15 @@ export function wrapTool<T extends AnyToolCallback>(handler: T, opts: MapGoogleE
 
 /**
  * Single choke point: patches `server.tool` so every tool registered from
- * here on (across all services) has its handler wrapped with `wrapTool`,
- * without needing to touch each of the individual tool registrations.
+ * here on (across all services) has its handler wrapped with `wrapTool` and,
+ * unless `strictParams` is false, its input schema made strict, without
+ * needing to touch each of the individual tool registrations.
  */
-export function installToolErrorHandling(server: McpServer, opts: MapGoogleErrorOptions = {}): void {
+export function installToolErrorHandling(
+  server: McpServer,
+  opts: MapGoogleErrorOptions & { strictParams?: boolean } = {}
+): void {
+  const { strictParams = true, ...errorOpts } = opts;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const original = server.tool.bind(server) as (...args: any[]) => any;
   const stats = newStrictifyStats();
@@ -155,8 +160,10 @@ export function installToolErrorHandling(server: McpServer, opts: MapGoogleError
   (server as any).tool = (...args: any[]) => {
     const lastIndex = args.length - 1;
     if (typeof args[lastIndex] === "function") {
-      args[lastIndex] = wrapTool(args[lastIndex], opts);
+      args[lastIndex] = wrapTool(args[lastIndex], errorOpts);
     }
+    // Strictness off: keep the SDK's own schema, which strips unknown keys.
+    if (!strictParams) return original(...args);
     // Let the SDK resolve its own overloads (description / raw shape /
     // annotations, in any combination), then make the schema it built strict.
     // Post-processing the RegisteredTool avoids re-implementing the overload
