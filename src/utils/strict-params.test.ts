@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { OAuth2Client } from "google-auth-library";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -19,7 +19,15 @@ function schemaOf(server: McpServer, name: string): any {
 }
 
 describe("strict tool parameters (registration choke point)", () => {
-  const server = createServer(makeCtx());
+  // Independent of the shell: these tests assume the default (strict) mode.
+  let server: McpServer;
+  beforeAll(() => {
+    vi.stubEnv("GOOGLE_MCP_STRICT_PARAMS", undefined);
+    server = createServer(makeCtx());
+  });
+  afterAll(() => {
+    vi.unstubAllEnvs();
+  });
   const event = { calendarId: "primary", summary: "s", start: "2026-10-01T10:00:00", end: "2026-10-01T11:00:00" };
 
   it("makes every registered tool strict", () => {
@@ -110,6 +118,22 @@ describe("strict tool parameters (registration choke point)", () => {
     expect(() => assertToolsStrict(s)).toThrow(/bypass/);
   });
 
+  it("reaches objects inside a union and inside a record", () => {
+    const s = createServer(makeCtx(), { families: ["meet"] });
+    s.tool(
+      "union-record",
+      {
+        u: z.union([z.object({ a: z.string() }), z.object({ b: z.string() })]).optional(),
+        m: z.record(z.string(), z.object({ a: z.string() })).optional(),
+      },
+      async () => ({ content: [] })
+    );
+    const schema = schemaOf(s, "union-record");
+    expect(schema.safeParse({ u: { a: "x" }, m: { k: { a: "x" } } }).success).toBe(true);
+    expect(schema.safeParse({ u: { a: "x", extra: 1 } }).success).toBe(false);
+    expect(schema.safeParse({ m: { k: { a: "x", extra: 1 } } }).success).toBe(false);
+  });
+
   it("throws at registration when an object is nested under z.preprocess", () => {
     const s = createServer(makeCtx(), { families: ["meet"] });
     expect(() =>
@@ -152,6 +176,17 @@ describe("deepStrict edge cases", () => {
     expect(out.safeParse({ o: { n: { x: "a" } } }).success).toBe(true);
     expect(out.safeParse({ o: { n: { x: "a", typo: 1 } } }).success).toBe(false);
   });
+  it("keeps an object's own error map for issues other than unrecognized keys", () => {
+    const own = z.object(
+      { a: z.string() },
+      { error: (iss) => (iss.code === "invalid_type" ? "o must be an object" : undefined) }
+    );
+    const out = deepStrict(z.object({ o: own }), newStrictifyStats());
+    const r = out.safeParse({ o: "not-an-object" });
+    expect(r.success).toBe(false);
+    expect(r.error.issues[0].message).toBe("o must be an object");
+    expect(out.safeParse({ o: { a: "x", b: 1 } }).error.issues[0].message).toContain("Valid keys: a");
+  });
   it("refuses .catch() rather than turning a typo into a silent fallback", () => {
     expect(() =>
       deepStrict(z.object({ o: z.object({ a: z.string() }).catch({ a: "DEFAULT" }) }), newStrictifyStats())
@@ -160,7 +195,9 @@ describe("deepStrict edge cases", () => {
 });
 
 describe("GOOGLE_MCP_STRICT_PARAMS runtime opt-out", () => {
-  afterEach(() => {
+  const open: Array<{ close(): Promise<void> }> = [];
+  afterEach(async () => {
+    for (const c of open.splice(0)) await c.close();
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
@@ -173,13 +210,16 @@ describe("GOOGLE_MCP_STRICT_PARAMS runtime opt-out", () => {
     s.tool("echo_args", { timeZone: z.string().optional() }, async (args) => ({
       content: [{ type: "text", text: JSON.stringify(args) }],
     }));
-    s.tool("nested_args", { range: z.object({ start: z.string(), end: z.string() }).optional() }, async (args) => ({
-      content: [{ type: "text", text: JSON.stringify(args) }],
-    }));
+    s.tool(
+      "nested_args",
+      { range: z.object({ start: z.string(), end: z.string() }).optional(), none: z.object({}).optional() },
+      async (args) => ({ content: [{ type: "text", text: JSON.stringify(args) }] })
+    );
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
     await s.connect(serverSide);
     const client = new Client({ name: "test", version: "0" });
     await client.connect(clientSide);
+    open.push(client, s);
     return client;
   }
   const stray = { timeZone: "UTC", tmiezone: "UTC" };
@@ -199,6 +239,24 @@ describe("GOOGLE_MCP_STRICT_PARAMS runtime opt-out", () => {
     expect(errSpy).not.toHaveBeenCalledWith(expect.stringContaining("GOOGLE_MCP_STRICT_PARAMS"));
   });
 
+  for (const value of ["1", "false", ""]) {
+    it(`=${JSON.stringify(value)}: strict stays on through the request path`, async () => {
+      vi.stubEnv("GOOGLE_MCP_STRICT_PARAMS", value);
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const client = await connect();
+      const r = await client.callTool({ name: "calendar_get_current_time", arguments: stray });
+      expect(r.isError).toBe(true);
+      expect(text(r)).toContain('Unrecognized key: "tmiezone"');
+      const lines = errSpy.mock.calls.filter((c) => String(c[0]).includes("GOOGLE_MCP_STRICT_PARAMS"));
+      if (value === "") {
+        expect(lines).toHaveLength(0);
+      } else {
+        expect(lines).toHaveLength(1);
+        expect(String(lines[0][0])).toContain("not recognized");
+      }
+    });
+  }
+
   it("unset: the rejection names the valid keys at the level of the stray key", async () => {
     vi.stubEnv("GOOGLE_MCP_STRICT_PARAMS", undefined);
     const client = await connect();
@@ -213,6 +271,8 @@ describe("GOOGLE_MCP_STRICT_PARAMS runtime opt-out", () => {
     });
     expect(nested.isError).toBe(true);
     expect(text(nested)).toContain('Unrecognized key: "ennd". Valid keys: start, end at range');
+    const empty = await client.callTool({ name: "nested_args", arguments: { none: { x: 1 } } });
+    expect(text(empty)).toContain('Unrecognized key: "x". Valid keys: (none) at none');
   });
 
   it("=0: the same call succeeds and the stray key is dropped; one stderr line names the variable", async () => {

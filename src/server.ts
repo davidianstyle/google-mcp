@@ -77,10 +77,15 @@ export function createServer(ctx: ServiceContext, opts: CreateServerOptions = {}
   // GOOGLE_MCP_STRICT_PARAMS=0 is a runtime opt-out: unknown parameters are
   // dropped silently (the SDK default) instead of rejected. Any other value,
   // or unset, keeps strict checking on.
-  const strictParams = process.env.GOOGLE_MCP_STRICT_PARAMS !== "0";
+  const strictEnv = process.env.GOOGLE_MCP_STRICT_PARAMS;
+  const strictParams = strictEnv !== "0";
   if (!strictParams) {
     console.error(
       "[google-mcp] strict param checking is OFF (GOOGLE_MCP_STRICT_PARAMS=0): unknown tool parameters are dropped silently"
+    );
+  } else if (strictEnv) {
+    console.error(
+      `[google-mcp] GOOGLE_MCP_STRICT_PARAMS=${JSON.stringify(strictEnv)} is not recognized; strict param checking stays ON (only "0" turns it off)`
     );
   }
   installToolErrorHandling(server, { accountSlug: ctx.accountSlug, strictParams });

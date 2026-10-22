@@ -15,7 +15,8 @@ import { z } from "zod";
  * untouched; wrappers are cloned with their `def` intact (checks such as
  * `.min(1)` survive) and parented to the original, so registry metadata
  * (`.describe()`) is inherited. Each rebuilt object's unrecognized-key error
- * also names the keys that object accepts.
+ * also names the keys that object accepts. Inside a union, zod reports the
+ * failure as `invalid_union` instead, so that hint does not reach the client.
  *
  * Objects that declare a non-`never` catchall (`.passthrough()`, `z.looseObject`,
  * `.catchall(x)`) are an explicit opt-out and are left alone; an object that is
@@ -107,7 +108,8 @@ function unknownKeyError(validKeys: string[], previous: AnySchema): AnySchema {
   return (issue: AnySchema) => {
     if (issue.code === "unrecognized_keys") {
       const keys = (issue.keys as string[]).map((k) => JSON.stringify(k)).join(", ");
-      return `Unrecognized key${issue.keys.length > 1 ? "s" : ""}: ${keys}. Valid keys: ${validKeys.join(", ")}`;
+      const valid = validKeys.length > 0 ? validKeys.join(", ") : "(none)";
+      return `Unrecognized key${issue.keys.length > 1 ? "s" : ""}: ${keys}. Valid keys: ${valid}`;
     }
     return previous?.(issue);
   };

@@ -170,7 +170,12 @@ export function installToolErrorHandling(
     // parsing here, which is where a choke point could mis-register silently.
     const registered = original(...args);
     try {
-      // Private SDK field: an SDK that cached or copied the schema at registration would silently lose strictness; the request-path test "unset: a stray key is rejected with an input validation error" catches that.
+      // Private SDK field. An SDK that cached or copied the schema at
+      // registration would silently lose strictness; the request-path test
+      // "unset: a stray key is rejected with an input validation error"
+      // catches that. The SDK's own `registered.update({ paramsSchema })` also
+      // rebuilds this field from the raw shape, silently undoing strictness for
+      // that tool, so nothing here may call it.
       registered.inputSchema = strictifyRegisteredSchema(args[0], registered.inputSchema, stats);
     } catch (error) {
       // The SDK has already registered the tool with its loose default schema;
@@ -186,15 +191,16 @@ export function installToolErrorHandling(
 export const strictifyStats = new WeakMap<McpServer, StrictifyStats>();
 
 /**
- * Startup invariant: every registered tool either takes no arguments at all
- * (no schema, or an object with no properties, which stays lenient on purpose)
- * or has a strict top-level input schema. A top-level object that declares a
- * catchall is accepted: `never` is what the choke point installs, and any other
- * catchall (`.passthrough()` / `looseObject` / `.catchall(x)`) is a deliberate
- * opt-out that `deepStrict` also leaves alone, so the two policies agree.
- * Such opt-outs are tallied as `passthrough`, not `strict`. Catches any registration that bypassed the patched `server.tool` (e.g. a
- * future direct `registerTool` call). Throws, so a violation fails at startup,
- * not per call.
+ * Startup check of each registered tool's TOP-LEVEL input schema only: it is
+ * either absent or an object with no properties (a no-arg tool, lenient on
+ * purpose), or an object that declares a catchall. A `never` catchall (what the
+ * choke point installs) is tallied as `strict`; any other catchall
+ * (`.passthrough()` / `looseObject` / `.catchall(x)`) is a deliberate opt-out,
+ * tallied as `passthrough`. A top-level object with no catchall fails the
+ * check, which catches a registration that bypassed the patched `server.tool`
+ * (e.g. a direct `registerTool` call). Nested objects are not inspected: a
+ * bypassing registration with a strict top level but a loose nested object
+ * passes. Throws, so a violation fails at startup, not per call.
  */
 export function assertToolsStrict(server: McpServer): { strict: number; passthrough: number; noArgs: number } {
   // `_registeredTools` is a private SDK field; fail clearly if an SDK upgrade moves it.
