@@ -15,8 +15,9 @@ import { z } from "zod";
  * untouched; wrappers are cloned with their `def` intact (checks such as
  * `.min(1)` survive) and parented to the original, so registry metadata
  * (`.describe()`) is inherited. Each rebuilt object's unrecognized-key error
- * also names the keys that object accepts. Inside a union, zod reports the
- * failure as `invalid_union` instead, so that hint does not reach the client.
+ * also names the keys that object accepts. Inside a plain `z.union` of objects
+ * zod may report `invalid_union` instead, so the hint may not reach the client;
+ * a `z.discriminatedUnion` shows it.
  *
  * Objects that declare a non-`never` catchall (`.passthrough()`, `z.looseObject`,
  * `.catchall(x)`) are an explicit opt-out and are left alone; an object that is
@@ -43,14 +44,12 @@ import { z } from "zod";
 type AnySchema = any;
 
 export interface StrictifyStats {
-  /** Object nodes made strict (top level included). */
-  objects: number;
   /** Object nodes left alone because they already declared a catchall. */
   explicitCatchall: number;
 }
 
 export function newStrictifyStats(): StrictifyStats {
-  return { objects: 0, explicitCatchall: 0 };
+  return { explicitCatchall: 0 };
 }
 
 /** Wrapper types whose single child lives at `def.innerType`. */
@@ -101,12 +100,15 @@ function cloneWith(schema: AnySchema, patch: Record<string, unknown>): AnySchema
 
 /**
  * Error map for a strict object node: an unrecognized-key issue raised by this
- * node also names the keys it accepts, so a client can correct the call. Every
- * other issue falls through to the node's own error map (if any), then zod's.
+ * node also names the keys it accepts, so a client can correct the call, unless
+ * the node's own error map already supplies a message for it. Every other issue
+ * falls through to the node's own error map (if any), then zod's.
  */
 function unknownKeyError(validKeys: string[], previous: AnySchema): AnySchema {
   return (issue: AnySchema) => {
     if (issue.code === "unrecognized_keys") {
+      const own = previous?.(issue);
+      if (typeof own === "string" || typeof own?.message === "string") return own;
       const keys = (issue.keys as string[]).map((k) => JSON.stringify(k)).join(", ");
       const valid = validKeys.length > 0 ? validKeys.join(", ") : "(none)";
       return `Unrecognized key${issue.keys.length > 1 ? "s" : ""}: ${keys}. Valid keys: ${valid}`;
@@ -143,7 +145,6 @@ export function deepStrict(
     for (const [key, child] of Object.entries(def.shape as Record<string, AnySchema>)) {
       shape[key] = deepStrict(child, stats, toolName, [...path, key]);
     }
-    stats.objects++;
     return cloneWith(schema, { shape, catchall: z.never(), error: unknownKeyError(Object.keys(shape), def.error) });
   }
 

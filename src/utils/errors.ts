@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
-import { isZeroParamObject, newStrictifyStats, strictifyRegisteredSchema, type StrictifyStats } from "./strict-params.js";
+import { isZeroParamObject, newStrictifyStats, strictifyRegisteredSchema } from "./strict-params.js";
 
 /** Shape of the pieces of a GaxiosError we read. Duck-typed so tests don't need a real GaxiosError. */
 interface GaxiosLikeError {
@@ -154,7 +154,6 @@ export function installToolErrorHandling(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const original = server.tool.bind(server) as (...args: any[]) => any;
   const stats = newStrictifyStats();
-  strictifyStats.set(server, stats);
   // `tool` has many overloads but the callback is always the last argument.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (server as any).tool = (...args: any[]) => {
@@ -171,9 +170,9 @@ export function installToolErrorHandling(
     const registered = original(...args);
     try {
       // Private SDK field. An SDK that cached or copied the schema at
-      // registration would silently lose strictness; the request-path test
-      // "unset: a stray key is rejected with an input validation error"
-      // catches that. The SDK's own `registered.update({ paramsSchema })` also
+      // registration would silently lose strictness; a request-path test that
+      // sends a stray key through the SDK's real validation catches that. The
+      // SDK's own `registered.update({ paramsSchema })` also
       // rebuilds this field from the raw shape, silently undoing strictness for
       // that tool, so nothing here may call it.
       registered.inputSchema = strictifyRegisteredSchema(args[0], registered.inputSchema, stats);
@@ -186,9 +185,6 @@ export function installToolErrorHandling(
     return registered;
   };
 }
-
-/** Per-server strictify coverage, for startup assertions and tests. */
-export const strictifyStats = new WeakMap<McpServer, StrictifyStats>();
 
 /**
  * Startup check of each registered tool's TOP-LEVEL input schema only: it is

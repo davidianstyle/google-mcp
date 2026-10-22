@@ -212,7 +212,16 @@ describe("GOOGLE_MCP_STRICT_PARAMS runtime opt-out", () => {
     }));
     s.tool(
       "nested_args",
-      { range: z.object({ start: z.string(), end: z.string() }).optional(), none: z.object({}).optional() },
+      {
+        range: z.object({ start: z.string(), end: z.string() }).optional(),
+        none: z.object({}).optional(),
+        authored: z
+          .strictObject(
+            { a: z.string() },
+            { error: (i) => (i.code === "unrecognized_keys" ? "only 'a' is allowed here" : undefined) }
+          )
+          .optional(),
+      },
       async (args) => ({ content: [{ type: "text", text: JSON.stringify(args) }] })
     );
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
@@ -273,6 +282,17 @@ describe("GOOGLE_MCP_STRICT_PARAMS runtime opt-out", () => {
     expect(text(nested)).toContain('Unrecognized key: "ennd". Valid keys: start, end at range');
     const empty = await client.callTool({ name: "nested_args", arguments: { none: { x: 1 } } });
     expect(text(empty)).toContain('Unrecognized key: "x". Valid keys: (none) at none');
+  });
+
+  it("unset: a schema's own unrecognized-key message wins over the valid-keys hint", async () => {
+    vi.stubEnv("GOOGLE_MCP_STRICT_PARAMS", undefined);
+    const client = await connect();
+    const authored = await client.callTool({ name: "nested_args", arguments: { authored: { a: "x", b: 1 } } });
+    expect(authored.isError).toBe(true);
+    expect(text(authored)).toContain("only 'a' is allowed here at authored");
+    expect(text(authored)).not.toContain("Valid keys");
+    const plain = await client.callTool({ name: "nested_args", arguments: { range: { start: "a", end: "b", x: 1 } } });
+    expect(text(plain)).toContain('Unrecognized key: "x". Valid keys: start, end at range');
   });
 
   it("=0: the same call succeeds and the stray key is dropped; one stderr line names the variable", async () => {
